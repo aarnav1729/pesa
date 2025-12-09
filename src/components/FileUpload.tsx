@@ -58,11 +58,11 @@ export function FileUpload({ onFilesSelected, isProcessing }: FileUploadProps) {
       {/* Upload Area */}
       <div
         className={cn(
-          'relative rounded-2xl border-2 border-dashed p-12 transition-all duration-300 cursor-pointer',
-          'bg-card/50 backdrop-blur-sm',
+          'relative rounded-xl border-2 border-dashed p-12 transition-all duration-200 cursor-pointer',
+          'bg-card shadow-enterprise',
           dragActive
-            ? 'border-primary bg-primary/10 shadow-glow scale-[1.02]'
-            : 'border-border hover:border-primary/50 hover:bg-card/80'
+            ? 'border-primary bg-primary/5 shadow-enterprise-lg scale-[1.01]'
+            : 'border-border hover:border-primary/50 hover:shadow-enterprise-md'
         )}
         onDragEnter={handleDrag}
         onDragLeave={handleDrag}
@@ -81,8 +81,8 @@ export function FileUpload({ onFilesSelected, isProcessing }: FileUploadProps) {
         
         <div className="flex flex-col items-center gap-4 text-center">
           <div className={cn(
-            'p-4 rounded-2xl transition-all duration-300',
-            dragActive ? 'gradient-primary scale-110' : 'bg-secondary'
+            'p-4 rounded-xl transition-all duration-200',
+            dragActive ? 'gradient-primary scale-105' : 'bg-muted'
           )}>
             <Upload className={cn(
               'w-8 h-8 transition-colors',
@@ -112,14 +112,16 @@ export function FileUpload({ onFilesSelected, isProcessing }: FileUploadProps) {
             {selectedFiles.map((file, index) => (
               <div
                 key={`${file.name}-${index}`}
-                className="flex items-center justify-between p-3 rounded-lg bg-secondary/50 border border-border group hover:bg-secondary transition-colors"
+                className="flex items-center justify-between p-3 rounded-lg bg-card border border-border group hover:border-primary/30 transition-colors shadow-enterprise"
               >
                 <div className="flex items-center gap-3">
-                  <FileSpreadsheet className="w-5 h-5 text-primary" />
-                  <span className="text-sm font-medium truncate max-w-[300px]">
+                  <div className="p-2 rounded-md bg-primary/10">
+                    <FileSpreadsheet className="w-4 h-4 text-primary" />
+                  </div>
+                  <span className="text-sm font-medium text-foreground truncate max-w-[280px]">
                     {file.name}
                   </span>
-                  <span className="text-xs text-muted-foreground">
+                  <span className="text-xs text-muted-foreground px-2 py-0.5 bg-muted rounded-md">
                     {(file.size / 1024).toFixed(1)} KB
                   </span>
                 </div>
@@ -129,7 +131,7 @@ export function FileUpload({ onFilesSelected, isProcessing }: FileUploadProps) {
                     e.stopPropagation();
                     removeFile(index);
                   }}
-                  className="p-1 rounded-md opacity-0 group-hover:opacity-100 hover:bg-destructive/20 transition-all"
+                  className="p-1.5 rounded-md opacity-0 group-hover:opacity-100 hover:bg-destructive/10 transition-all"
                 >
                   <X className="w-4 h-4 text-destructive" />
                 </button>

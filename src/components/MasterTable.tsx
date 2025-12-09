@@ -22,11 +22,36 @@ type SortConfig = {
   direction: 'asc' | 'desc';
 } | null;
 
+// Get color grade based on percentage change
+function getValueColorClass(current: number, previous: number | undefined): string {
+  if (previous === undefined || previous === 0) return '';
+  
+  const change = ((current - previous) / previous) * 100;
+  
+  if (change > 50) return 'cell-positive-4';
+  if (change > 25) return 'cell-positive-3';
+  if (change > 10) return 'cell-positive-2';
+  if (change > 0) return 'cell-positive-1';
+  if (change < -50) return 'cell-negative-4';
+  if (change < -25) return 'cell-negative-3';
+  if (change < -10) return 'cell-negative-2';
+  if (change < 0) return 'cell-negative-1';
+  
+  return '';
+}
+
+// Get color for bought/sold values
+function getBuySellColorClass(bought: number, sold: number): string {
+  const net = bought - sold;
+  if (net > 0) return 'cell-positive-2';
+  if (net < 0) return 'cell-negative-2';
+  return '';
+}
+
 export function MasterTable({ holdings, dates, onClearData }: MasterTableProps) {
   const [searchTerm, setSearchTerm] = useState('');
   const [sortConfig, setSortConfig] = useState<SortConfig>(null);
   const [filters, setFilters] = useState<Record<string, string>>({});
-  const [activeFilterColumn, setActiveFilterColumn] = useState<string | null>(null);
 
   // Get unique values for filter dropdowns
   const uniqueValues = useMemo(() => {
@@ -112,12 +137,12 @@ export function MasterTable({ holdings, dates, onClearData }: MasterTableProps) 
 
   const SortIcon = ({ columnKey }: { columnKey: string }) => {
     if (sortConfig?.key !== columnKey) {
-      return <ArrowUpDown className="w-4 h-4 text-muted-foreground" />;
+      return <ArrowUpDown className="w-3.5 h-3.5 text-muted-foreground" />;
     }
     return sortConfig.direction === 'asc' ? (
-      <ArrowUp className="w-4 h-4 text-primary" />
+      <ArrowUp className="w-3.5 h-3.5 text-primary" />
     ) : (
-      <ArrowDown className="w-4 h-4 text-primary" />
+      <ArrowDown className="w-3.5 h-3.5 text-primary" />
     );
   };
 
@@ -132,8 +157,8 @@ export function MasterTable({ holdings, dates, onClearData }: MasterTableProps) 
       <DropdownMenuTrigger asChild>
         <button
           className={cn(
-            'p-1 rounded hover:bg-secondary transition-colors',
-            filters[columnKey] && 'text-primary'
+            'p-1 rounded hover:bg-muted transition-colors',
+            filters[columnKey] && 'text-primary bg-primary/10'
           )}
         >
           <Filter className="w-3 h-3" />
@@ -178,7 +203,7 @@ export function MasterTable({ holdings, dates, onClearData }: MasterTableProps) 
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'holdings-export.csv';
+    a.download = 'pesa-export.csv';
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -193,12 +218,12 @@ export function MasterTable({ holdings, dates, onClearData }: MasterTableProps) 
             placeholder="Search by name, DPID, client ID, or category..."
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
-            className="pl-10 bg-secondary/50 border-border"
+            className="pl-10 bg-card border-border shadow-enterprise"
           />
           {searchTerm && (
             <button
               onClick={() => setSearchTerm('')}
-              className="absolute right-3 top-1/2 -translate-y-1/2 p-1 hover:bg-secondary rounded"
+              className="absolute right-3 top-1/2 -translate-y-1/2 p-1 hover:bg-muted rounded"
             >
               <X className="w-4 h-4 text-muted-foreground" />
             </button>
@@ -206,11 +231,11 @@ export function MasterTable({ holdings, dates, onClearData }: MasterTableProps) 
         </div>
 
         <div className="flex gap-2">
-          <Button variant="outline" size="sm" onClick={exportToCSV}>
+          <Button variant="outline" size="sm" onClick={exportToCSV} className="shadow-enterprise">
             <Download className="w-4 h-4" />
             Export CSV
           </Button>
-          <Button variant="outline" size="sm" onClick={onClearData} className="text-destructive hover:text-destructive">
+          <Button variant="outline" size="sm" onClick={onClearData} className="text-destructive hover:text-destructive shadow-enterprise">
             <Trash2 className="w-4 h-4" />
             Clear Data
           </Button>
@@ -225,12 +250,12 @@ export function MasterTable({ holdings, dates, onClearData }: MasterTableProps) 
               value && (
                 <span
                   key={key}
-                  className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded-full bg-primary/20 text-primary border border-primary/30"
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-full bg-primary/10 text-primary border border-primary/20"
                 >
                   {key}: {value}
                   <button
                     onClick={() => setFilters((f) => ({ ...f, [key]: '' }))}
-                    className="hover:text-foreground"
+                    className="hover:text-foreground transition-colors"
                   >
                     <X className="w-3 h-3" />
                   </button>
@@ -243,26 +268,47 @@ export function MasterTable({ holdings, dates, onClearData }: MasterTableProps) 
       {/* Stats */}
       <div className="flex gap-4 mb-4 text-sm text-muted-foreground">
         <span>
-          Showing <span className="text-foreground font-medium">{filteredData.length}</span> of{' '}
-          <span className="text-foreground font-medium">{holdings.length}</span> records
+          Showing <span className="text-foreground font-semibold">{filteredData.length}</span> of{' '}
+          <span className="text-foreground font-semibold">{holdings.length}</span> records
         </span>
-        <span>•</span>
+        <span className="text-border">|</span>
         <span>
-          <span className="text-foreground font-medium">{dates.length}</span> date columns
+          <span className="text-foreground font-semibold">{dates.length}</span> date columns
         </span>
       </div>
 
+      {/* Color Legend */}
+      <div className="flex gap-6 mb-4 p-3 bg-card rounded-lg border border-border shadow-enterprise text-xs">
+        <div className="flex items-center gap-2">
+          <span className="text-muted-foreground font-medium">Value Change:</span>
+          <div className="flex items-center gap-1">
+            <span className="w-4 h-4 rounded cell-positive-1"></span>
+            <span className="w-4 h-4 rounded cell-positive-2"></span>
+            <span className="w-4 h-4 rounded cell-positive-3"></span>
+            <span className="w-4 h-4 rounded cell-positive-4"></span>
+            <span className="text-muted-foreground ml-1">Increase</span>
+          </div>
+          <div className="flex items-center gap-1 ml-3">
+            <span className="w-4 h-4 rounded cell-negative-1"></span>
+            <span className="w-4 h-4 rounded cell-negative-2"></span>
+            <span className="w-4 h-4 rounded cell-negative-3"></span>
+            <span className="w-4 h-4 rounded cell-negative-4"></span>
+            <span className="text-muted-foreground ml-1">Decrease</span>
+          </div>
+        </div>
+      </div>
+
       {/* Table */}
-      <div className="rounded-xl border border-border overflow-hidden shadow-card">
+      <div className="rounded-lg border border-border overflow-hidden shadow-enterprise-lg bg-card">
         <div className="overflow-x-auto">
           <table className="w-full">
             <thead>
-              <tr className="bg-secondary/70">
-                <th className="sticky left-0 z-10 bg-secondary/70 px-4 py-3 text-left">
+              <tr className="bg-muted/50 border-b border-border">
+                <th className="sticky left-0 z-10 bg-muted/50 px-4 py-3 text-left">
                   <div className="flex items-center gap-2">
                     <button
                       onClick={() => handleSort('dpid')}
-                      className="flex items-center gap-1 text-xs font-semibold uppercase tracking-wider text-muted-foreground hover:text-foreground transition-colors"
+                      className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-muted-foreground hover:text-foreground transition-colors"
                     >
                       DPID
                       <SortIcon columnKey="dpid" />
@@ -274,7 +320,7 @@ export function MasterTable({ holdings, dates, onClearData }: MasterTableProps) 
                   <div className="flex items-center gap-2">
                     <button
                       onClick={() => handleSort('clientId')}
-                      className="flex items-center gap-1 text-xs font-semibold uppercase tracking-wider text-muted-foreground hover:text-foreground transition-colors"
+                      className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-muted-foreground hover:text-foreground transition-colors"
                     >
                       CLIENT-ID
                       <SortIcon columnKey="clientId" />
@@ -286,7 +332,7 @@ export function MasterTable({ holdings, dates, onClearData }: MasterTableProps) 
                   <div className="flex items-center gap-2">
                     <button
                       onClick={() => handleSort('category')}
-                      className="flex items-center gap-1 text-xs font-semibold uppercase tracking-wider text-muted-foreground hover:text-foreground transition-colors"
+                      className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-muted-foreground hover:text-foreground transition-colors"
                     >
                       CATEGORY
                       <SortIcon columnKey="category" />
@@ -297,7 +343,7 @@ export function MasterTable({ holdings, dates, onClearData }: MasterTableProps) 
                 <th className="px-4 py-3 text-left min-w-[200px]">
                   <button
                     onClick={() => handleSort('name')}
-                    className="flex items-center gap-1 text-xs font-semibold uppercase tracking-wider text-muted-foreground hover:text-foreground transition-colors"
+                    className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-muted-foreground hover:text-foreground transition-colors"
                   >
                     NAME
                     <SortIcon columnKey="name" />
@@ -307,7 +353,7 @@ export function MasterTable({ holdings, dates, onClearData }: MasterTableProps) 
                   <th key={date} className="px-4 py-3 text-center" colSpan={2}>
                     <button
                       onClick={() => handleSort(`date-${date}`)}
-                      className="flex items-center gap-1 text-xs font-semibold uppercase tracking-wider text-muted-foreground hover:text-foreground transition-colors mx-auto"
+                      className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-muted-foreground hover:text-foreground transition-colors mx-auto"
                     >
                       {date}
                       <SortIcon columnKey={`date-${date}`} />
@@ -315,8 +361,8 @@ export function MasterTable({ holdings, dates, onClearData }: MasterTableProps) 
                   </th>
                 ))}
               </tr>
-              <tr className="bg-secondary/50">
-                <th className="sticky left-0 z-10 bg-secondary/50"></th>
+              <tr className="bg-muted/30 border-b border-border">
+                <th className="sticky left-0 z-10 bg-muted/30"></th>
                 <th></th>
                 <th></th>
                 <th></th>
@@ -337,37 +383,54 @@ export function MasterTable({ holdings, dates, onClearData }: MasterTableProps) 
                 <tr
                   key={holding.id}
                   className={cn(
-                    'border-t border-border/50 hover:bg-secondary/30 transition-colors',
-                    index % 2 === 0 ? 'bg-card/30' : 'bg-card/50'
+                    'border-b border-border/50 hover:bg-muted/30 transition-colors',
+                    index % 2 === 0 ? 'bg-card' : 'bg-muted/10'
                   )}
                 >
-                  <td className="sticky left-0 z-10 px-4 py-3 font-mono text-sm bg-inherit">
+                  <td className="sticky left-0 z-10 px-4 py-3 font-mono text-sm bg-inherit border-r border-border/30">
                     {holding.dpid}
                   </td>
                   <td className="px-4 py-3 font-mono text-sm">{holding.clientId}</td>
                   <td className="px-4 py-3">
                     {holding.category && (
-                      <span className="inline-flex px-2 py-0.5 text-xs rounded-full bg-primary/20 text-primary">
+                      <span className="inline-flex px-2 py-0.5 text-xs font-medium rounded-md bg-accent/10 text-accent border border-accent/20">
                         {holding.category}
                       </span>
                     )}
                   </td>
-                  <td className="px-4 py-3 font-medium">{holding.name}</td>
-                  {dates.map((date) => {
+                  <td className="px-4 py-3 font-medium text-foreground">{holding.name}</td>
+                  {dates.map((date, dateIndex) => {
                     const dv = holding.dateValues[date];
+                    const prevDate = dateIndex > 0 ? dates[dateIndex - 1] : undefined;
+                    const prevValue = prevDate ? holding.dateValues[prevDate]?.value : undefined;
+                    const valueColorClass = dv ? getValueColorClass(dv.value, prevValue) : '';
+                    const bsColorClass = dv ? getBuySellColorClass(dv.bought, dv.sold) : '';
+                    
                     return (
                       <>
-                        <td key={`${date}-value`} className="px-3 py-3 text-center font-mono text-sm">
+                        <td 
+                          key={`${date}-value`} 
+                          className={cn(
+                            'px-3 py-3 text-center font-mono text-sm transition-colors',
+                            valueColorClass
+                          )}
+                        >
                           {dv?.value?.toLocaleString() || '-'}
                         </td>
-                        <td key={`${date}-bs`} className="px-3 py-3 text-center text-sm">
+                        <td 
+                          key={`${date}-bs`} 
+                          className={cn(
+                            'px-3 py-3 text-center text-sm',
+                            bsColorClass
+                          )}
+                        >
                           {dv ? (
                             <div className="flex flex-col items-center gap-0.5">
                               {dv.bought > 0 && (
-                                <span className="text-success font-medium">+{dv.bought.toLocaleString()}</span>
+                                <span className="text-success font-semibold">+{dv.bought.toLocaleString()}</span>
                               )}
                               {dv.sold > 0 && (
-                                <span className="text-destructive font-medium">-{dv.sold.toLocaleString()}</span>
+                                <span className="text-destructive font-semibold">-{dv.sold.toLocaleString()}</span>
                               )}
                               {!dv.bought && !dv.sold && <span className="text-muted-foreground">-</span>}
                             </div>
@@ -385,8 +448,8 @@ export function MasterTable({ holdings, dates, onClearData }: MasterTableProps) 
         </div>
 
         {filteredData.length === 0 && (
-          <div className="p-12 text-center text-muted-foreground">
-            <p>No records found matching your search criteria.</p>
+          <div className="p-12 text-center text-muted-foreground bg-muted/20">
+            <p className="font-medium">No records found matching your search criteria.</p>
           </div>
         )}
       </div>
