@@ -1,10 +1,22 @@
-import { useState, useEffect } from 'react';
-import { Database, Upload, BarChart3, TrendingUp, Shield, Zap } from 'lucide-react';
-import { FileUpload } from '@/components/FileUpload';
-import { MasterTable } from '@/components/MasterTable';
-import { parseXLSXFile, consolidateData } from '@/lib/xlsxParser';
-import { saveHoldings, getHoldings, clearAllData, HoldingRecord } from '@/lib/db';
-import { toast } from 'sonner';
+import { useState, useEffect } from "react";
+import {
+  Database,
+  Upload,
+  BarChart3,
+  TrendingUp,
+  Shield,
+  Zap,
+} from "lucide-react";
+import { FileUpload } from "@/components/FileUpload";
+import { MasterTable } from "@/components/MasterTable";
+import { parseXLSXFile, consolidateData } from "@/lib/xlsxParser";
+import {
+  saveHoldings,
+  getHoldings,
+  clearAllData,
+  HoldingRecord,
+} from "@/lib/db";
+import { toast } from "sonner";
 
 const Index = () => {
   const [holdings, setHoldings] = useState<HoldingRecord[]>([]);
@@ -12,15 +24,15 @@ const Index = () => {
   const [isProcessing, setIsProcessing] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
 
-  // Load data from IndexedDB on mount
   useEffect(() => {
     const loadData = async () => {
       try {
-        const { holdings: savedHoldings, dates: savedDates } = await getHoldings();
+        const { holdings: savedHoldings, dates: savedDates } =
+          await getHoldings();
         setHoldings(savedHoldings);
         setDates(savedDates);
       } catch (error) {
-        console.error('Error loading data:', error);
+        console.error("Error loading data:", error);
       } finally {
         setIsLoading(false);
       }
@@ -30,34 +42,36 @@ const Index = () => {
 
   const handleFilesSelected = async (files: File[]) => {
     setIsProcessing(true);
-    
+
     try {
       const parsedFiles = [];
-      
+
       for (const file of files) {
         const parsed = await parseXLSXFile(file);
         if (parsed) {
           parsedFiles.push(parsed);
         }
       }
-      
+
       if (parsedFiles.length === 0) {
-        toast.error('No valid data found in the uploaded files');
+        toast.error("No valid data found in the uploaded files");
         return;
       }
-      
-      const { holdings: newHoldings, dates: newDates } = consolidateData(parsedFiles);
-      
-      // Save to IndexedDB
+
+      const { holdings: newHoldings, dates: newDates } =
+        consolidateData(parsedFiles);
+
       await saveHoldings(newHoldings, newDates);
-      
+
       setHoldings(newHoldings);
       setDates(newDates);
-      
-      toast.success(`Successfully processed ${parsedFiles.length} file(s) with ${newHoldings.length} unique records`);
+
+      toast.success(
+        `Successfully processed ${parsedFiles.length} file(s) with ${newHoldings.length} unique records`
+      );
     } catch (error) {
-      console.error('Error processing files:', error);
-      toast.error('Error processing files. Please check the format.');
+      console.error("Error processing files:", error);
+      toast.error("Error processing files. Please check the format.");
     } finally {
       setIsProcessing(false);
     }
@@ -68,10 +82,10 @@ const Index = () => {
       await clearAllData();
       setHoldings([]);
       setDates([]);
-      toast.success('All data cleared successfully');
+      toast.success("All data cleared successfully");
     } catch (error) {
-      console.error('Error clearing data:', error);
-      toast.error('Error clearing data');
+      console.error("Error clearing data:", error);
+      toast.error("Error clearing data");
     }
   };
 
@@ -90,7 +104,6 @@ const Index = () => {
 
   return (
     <div className="min-h-screen bg-background">
-      {/* Header */}
       <header className="border-b border-border bg-card shadow-enterprise sticky top-0 z-50">
         <div className="container mx-auto px-4 py-4">
           <div className="flex items-center justify-between">
@@ -99,11 +112,15 @@ const Index = () => {
                 <TrendingUp className="w-6 h-6 text-primary-foreground" />
               </div>
               <div>
-                <h1 className="text-xl font-bold text-foreground tracking-tight">PESA</h1>
-                <p className="text-xs text-muted-foreground">Portfolio & Equity Shareholding Analyzer</p>
+                <h1 className="text-xl font-bold text-foreground tracking-tight">
+                  PESA
+                </h1>
+                <p className="text-xs text-muted-foreground">
+                  Portfolio & Equity Shareholding Analyzer
+                </p>
               </div>
             </div>
-            
+
             {hasData && (
               <button
                 onClick={() => {
@@ -120,43 +137,50 @@ const Index = () => {
         </div>
       </header>
 
-      <main className="container mx-auto px-4 py-8">
+      <main
+        className={
+          hasData
+            ? "mx-auto w-[95vw] px-2 sm:px-4 py-6"
+            : "container mx-auto px-4 py-8"
+        }
+      >
         {!hasData ? (
           <div className="max-w-4xl mx-auto">
-            {/* Hero Section */}
             <div className="text-center mb-12 animate-fade-in">
               <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-primary/10 text-primary text-sm font-medium mb-6 border border-primary/20">
                 <Shield className="w-4 h-4" />
-                Enterprise-Grade Analytics
+                PESA
               </div>
               <h2 className="text-4xl font-bold mb-4 text-foreground">
-                Portfolio & Equity
+                Premier Energies Stock Analysis
                 <br />
-                <span className="text-gradient">Shareholding Analyzer</span>
               </h2>
               <p className="text-lg text-muted-foreground max-w-2xl mx-auto leading-relaxed">
-                Upload multiple XLSX files to consolidate shareholding data, 
-                track bought/sold quantities, and analyze patterns across dates with color-coded insights.
+                Upload multiple XLSX files to consolidate shareholding data,
+                track bought/sold quantities, and analyze patterns across dates
+                with color-coded insights.
               </p>
             </div>
 
-            {/* Features */}
             <div className="grid md:grid-cols-3 gap-6 mb-12">
               {[
                 {
                   icon: Upload,
-                  title: 'Bulk Upload',
-                  description: 'Upload multiple XLSX files at once for quick data consolidation',
+                  title: "Bulk Upload",
+                  description:
+                    "Upload multiple XLSX files at once for quick data consolidation",
                 },
                 {
                   icon: Database,
-                  title: 'Local Storage',
-                  description: 'All data stored securely in your browser using IndexedDB',
+                  title: "Local Storage",
+                  description:
+                    "All data stored securely in your browser using IndexedDB",
                 },
                 {
                   icon: Zap,
-                  title: 'Smart Analysis',
-                  description: 'Color-coded cells highlight changes across dates instantly',
+                  title: "Smart Analysis",
+                  description:
+                    "Color-coded cells highlight changes across dates instantly",
                 },
               ].map((feature, i) => (
                 <div
@@ -167,33 +191,44 @@ const Index = () => {
                   <div className="p-3 rounded-lg bg-primary/10 w-fit mb-4">
                     <feature.icon className="w-5 h-5 text-primary" />
                   </div>
-                  <h3 className="font-semibold text-foreground mb-2">{feature.title}</h3>
-                  <p className="text-sm text-muted-foreground leading-relaxed">{feature.description}</p>
+                  <h3 className="font-semibold text-foreground mb-2">
+                    {feature.title}
+                  </h3>
+                  <p className="text-sm text-muted-foreground leading-relaxed">
+                    {feature.description}
+                  </p>
                 </div>
               ))}
             </div>
 
-            {/* Upload Section */}
-            <FileUpload onFilesSelected={handleFilesSelected} isProcessing={isProcessing} />
+            <FileUpload
+              onFilesSelected={handleFilesSelected}
+              isProcessing={isProcessing}
+            />
 
-            {/* Format Info */}
-            <div className="mt-12 p-6 rounded-xl bg-card border border-border shadow-enterprise">
+            <div className="mt-12 p-6 rounded-xl bg-card border border-border shadow-enterprise w-full">
               <h4 className="font-semibold text-foreground mb-3 flex items-center gap-2">
                 <BarChart3 className="w-4 h-4 text-primary" />
                 Expected File Format
               </h4>
-              <div className="overflow-x-auto bg-muted/50 rounded-lg p-4">
+              <div className="overflow-x-auto bg-muted/50 rounded-lg p-6">
                 <code className="text-xs text-muted-foreground font-mono block whitespace-pre">
-{`SNo | DPID | CLIENT-ID | NAME | SECOND | THIRD | AS ON 02-12-2025 | BOUGHT | SOLD | AS ON 03-12-2025 | CATEGORY`}
+                  {`SNo | DPID | CLIENT-ID | NAME | SECOND | THIRD | AS ON {DD-MM-YYYY} | BOUGHT | SOLD | AS ON {DD-MM-YYYY} | CATEGORY`}
                 </code>
               </div>
               <p className="text-sm text-muted-foreground mt-4 leading-relaxed">
-                Each file should contain the columns above. The "AS ON" date columns will be automatically detected and merged chronologically.
+                Each file should contain the columns above. The "AS ON" date
+                columns will be automatically detected and merged
+                chronologically.
               </p>
             </div>
           </div>
         ) : (
-          <MasterTable holdings={holdings} dates={dates} onClearData={handleClearData} />
+          <MasterTable
+            holdings={holdings}
+            dates={dates}
+            onClearData={handleClearData}
+          />
         )}
       </main>
     </div>
