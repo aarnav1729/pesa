@@ -23,7 +23,7 @@ import {
 
 interface MasterTableProps {
   holdings: HoldingRecord[];
-  dates: string[];
+  dates: string[]; // dateKeys (may include duplicates of base date)
   onClearData: () => void;
 }
 
@@ -31,6 +31,24 @@ type SortConfig = {
   key: string;
   direction: "asc" | "desc";
 } | null;
+
+/** Extract base date from a dateKey like "03-12-2025@@1-1" */
+function getBaseDate(dateKey: string): string {
+  return String(dateKey).split("@@")[0] || dateKey;
+}
+
+function parseDate(dateStr: string): Date {
+  const match = dateStr.match(/(\d{2})-(\d{2})-(\d{4})/);
+  if (match) {
+    const [, day, month, year] = match;
+    return new Date(
+      parseInt(year, 10),
+      parseInt(month, 10) - 1,
+      parseInt(day, 10)
+    );
+  }
+  return new Date(0);
+}
 
 function getValueColorClass(
   current: number,
@@ -124,9 +142,9 @@ export function MasterTable({
           aVal = a.category;
           bVal = b.category;
         } else if (sortConfig.key.startsWith("date-")) {
-          const date = sortConfig.key.replace("date-", "");
-          aVal = a.dateValues[date]?.value || 0;
-          bVal = b.dateValues[date]?.value || 0;
+          const dateKey = sortConfig.key.replace("date-", "");
+          aVal = a.dateValues[dateKey]?.value || 0;
+          bVal = b.dateValues[dateKey]?.value || 0;
         } else {
           return 0;
         }
@@ -199,15 +217,15 @@ export function MasterTable({
 
   const exportToCSV = () => {
     const headers = ["DPID", "CLIENT-ID", "CATEGORY", "NAME"];
-    orderedDates.forEach((date) => {
-      headers.push(`AS ON ${date}`);
+    orderedDates.forEach((dateKey) => {
+      headers.push(`AS ON ${getBaseDate(dateKey)}`);
       headers.push("BOUGHT/SOLD");
     });
 
     const rows = filteredData.map((h) => {
       const row = [h.dpid, h.clientId, h.category, h.name];
-      orderedDates.forEach((date) => {
-        const dv = h.dateValues[date];
+      orderedDates.forEach((dateKey) => {
+        const dv = h.dateValues[dateKey];
         row.push(String(dv?.value || 0));
         const boughtSold = dv
           ? (dv.bought > 0 ? `+${dv.bought}` : "") +
@@ -234,6 +252,63 @@ export function MasterTable({
   const toggleDateOrder = () => {
     setDateOrder((o) => (o === "asc" ? "desc" : "asc"));
   };
+
+  /** Determine latest base date + use the LAST column instance of that date */
+  const latestDateKey = useMemo(() => {
+    if (dates.length === 0) return "";
+
+    let latestBase = "";
+    let latestTime = -Infinity;
+
+    for (const dk of dates) {
+      const bd = getBaseDate(dk);
+      const t = parseDate(bd).getTime();
+      if (t > latestTime) {
+        latestTime = t;
+        latestBase = bd;
+      }
+    }
+
+    // pick last occurrence of that base date in the original order
+    for (let i = dates.length - 1; i >= 0; i--) {
+      if (getBaseDate(dates[i]) === latestBase) return dates[i];
+    }
+
+    return dates[dates.length - 1];
+  }, [dates]);
+
+  /** Summary rows table above main matrix */
+  const summaryRows = useMemo(() => {
+    return filteredData.map((h) => {
+      let totalBought = 0;
+      let totalSold = 0;
+
+      for (const dateKey of dates) {
+        const dv = h.dateValues[dateKey];
+        if (dv) {
+          totalBought += dv.bought || 0;
+          totalSold += dv.sold || 0;
+        }
+      }
+
+      const net = totalBought - totalSold;
+      const stillHolding = latestDateKey
+        ? h.dateValues[latestDateKey]?.value ?? 0
+        : 0;
+
+      return {
+        id: h.id,
+        dpid: h.dpid,
+        clientId: h.clientId,
+        category: h.category,
+        name: h.name,
+        bought: totalBought,
+        sold: totalSold,
+        net,
+        stillHolding,
+      };
+    });
+  }, [filteredData, dates, latestDateKey]);
 
   return (
     <div className="w-full animate-fade-in">
@@ -327,9 +402,116 @@ export function MasterTable({
         <span className="text-border">|</span>
         <span>
           <span className="text-foreground font-semibold">{dates.length}</span>{" "}
-          date columns
+          AS ON columns
         </span>
       </div>
+
+      {/* ===================== NEW SUMMARY TABLE ===================== */}
+      <div className="rounded-lg border border-border overflow-hidden shadow-enterprise-md bg-card mb-6">
+        <div className="px-4 py-3 bg-muted/30 border-b border-border">
+          <div className="flex items-center justify-between">
+            <div className="text-sm font-semibold text-foreground">
+              Summary (Bought/Sold totals + latest holding)
+            </div>
+            <div className="text-xs text-muted-foreground">
+              Latest snapshot key:{" "}
+              <span className="text-foreground font-medium">
+                {latestDateKey ? getBaseDate(latestDateKey) : "-"}
+              </span>
+            </div>
+          </div>
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="w-full">
+            <thead>
+              <tr className="bg-muted/50 border-b border-border">
+                <th className="px-4 py-2 text-left text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                  DPID
+                </th>
+                <th className="px-4 py-2 text-left text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                  ClientID
+                </th>
+                <th className="px-4 py-2 text-left text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                  Category
+                </th>
+                <th className="px-4 py-2 text-right text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                  Sold
+                </th>
+                <th className="px-4 py-2 text-left text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                  Name
+                </th>
+                <th className="px-4 py-2 text-right text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                  Bought
+                </th>
+                <th className="px-4 py-2 text-right text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                  Net
+                </th>
+                <th className="px-4 py-2 text-right text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                  Still Holding
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {summaryRows.map((r, idx) => (
+                <tr
+                  key={r.id}
+                  className={cn(
+                    "border-b border-border/50 hover:bg-muted/30 transition-colors",
+                    idx % 2 === 0 ? "bg-card" : "bg-muted/10"
+                  )}
+                >
+                  <td className="px-4 py-2 font-mono text-sm">{r.dpid}</td>
+                  <td className="px-4 py-2 font-mono text-sm">{r.clientId}</td>
+                  <td className="px-4 py-2">
+                    {r.category && (
+                      <span className="inline-flex px-2 py-0.5 text-xs font-medium rounded-md bg-accent/10 text-accent border border-accent/20">
+                        {r.category}
+                      </span>
+                    )}
+                  </td>
+                  <td className="px-4 py-2 text-right font-mono text-sm text-destructive">
+                    {r.sold.toLocaleString()}
+                  </td>
+                  <td className="px-4 py-2 text-sm font-medium text-foreground">
+                    {r.name}
+                  </td>
+                  <td className="px-4 py-2 text-right font-mono text-sm text-success">
+                    {r.bought.toLocaleString()}
+                  </td>
+                  <td
+                    className={cn(
+                      "px-4 py-2 text-right font-mono text-sm",
+                      r.net > 0
+                        ? "text-success"
+                        : r.net < 0
+                        ? "text-destructive"
+                        : "text-muted-foreground"
+                    )}
+                  >
+                    {r.net.toLocaleString()}
+                  </td>
+                  <td className="px-4 py-2 text-right font-mono text-sm">
+                    {r.stillHolding.toLocaleString()}
+                  </td>
+                </tr>
+              ))}
+
+              {summaryRows.length === 0 && (
+                <tr>
+                  <td
+                    colSpan={8}
+                    className="p-8 text-center text-muted-foreground"
+                  >
+                    No summary data available.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      {/* =================== END SUMMARY TABLE =================== */}
 
       {/* Color Legend */}
       <div className="flex gap-6 mb-4 p-3 bg-card rounded-lg border border-border shadow-enterprise text-xs">
@@ -354,7 +536,7 @@ export function MasterTable({
         </div>
       </div>
 
-      {/* Table */}
+      {/* Main Matrix Table */}
       <div className="rounded-lg border border-border overflow-hidden shadow-enterprise-lg bg-card">
         <div className="overflow-x-auto">
           <table className="w-full">
@@ -372,6 +554,7 @@ export function MasterTable({
                     <FilterButton columnKey="dpid" values={uniqueValues.dpid} />
                   </div>
                 </th>
+
                 <th className="px-4 py-3 text-left">
                   <div className="flex items-center gap-2">
                     <button
@@ -387,6 +570,7 @@ export function MasterTable({
                     />
                   </div>
                 </th>
+
                 <th className="px-4 py-3 text-left">
                   <div className="flex items-center gap-2">
                     <button
@@ -402,6 +586,7 @@ export function MasterTable({
                     />
                   </div>
                 </th>
+
                 <th className="px-4 py-3 text-left min-w-[200px]">
                   <button
                     onClick={() => handleSort("name")}
@@ -411,25 +596,31 @@ export function MasterTable({
                     <SortIcon columnKey="name" />
                   </button>
                 </th>
-                {orderedDates.map((date) => (
-                  <th key={date} className="px-4 py-3 text-center" colSpan={2}>
+
+                {orderedDates.map((dateKey) => (
+                  <th
+                    key={dateKey}
+                    className="px-4 py-3 text-center"
+                    colSpan={2}
+                  >
                     <button
-                      onClick={() => handleSort(`date-${date}`)}
+                      onClick={() => handleSort(`date-${dateKey}`)}
                       className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-muted-foreground hover:text-foreground transition-colors mx-auto"
                     >
-                      {date}
-                      <SortIcon columnKey={`date-${date}`} />
+                      {getBaseDate(dateKey)}
+                      <SortIcon columnKey={`date-${dateKey}`} />
                     </button>
                   </th>
                 ))}
               </tr>
+
               <tr className="bg-muted/30 border-b border-border">
                 <th className="sticky left-0 z-10 bg-muted/30"></th>
                 <th></th>
                 <th></th>
                 <th></th>
-                {orderedDates.map((date) => (
-                  <Fragment key={date}>
+                {orderedDates.map((dateKey) => (
+                  <Fragment key={dateKey}>
                     <th className="px-3 py-2 text-xs text-muted-foreground font-medium">
                       Value
                     </th>
@@ -440,6 +631,7 @@ export function MasterTable({
                 ))}
               </tr>
             </thead>
+
             <tbody>
               {filteredData.map((holding, index) => (
                 <tr
@@ -466,12 +658,13 @@ export function MasterTable({
                     {holding.name}
                   </td>
 
-                  {orderedDates.map((date, dateIndex) => {
-                    const dv = holding.dateValues[date];
-                    const prevDate =
+                  {orderedDates.map((dateKey, dateIndex) => {
+                    const dv = holding.dateValues[dateKey];
+
+                    const prevKey =
                       dateIndex > 0 ? orderedDates[dateIndex - 1] : undefined;
-                    const prevValue = prevDate
-                      ? holding.dateValues[prevDate]?.value
+                    const prevValue = prevKey
+                      ? holding.dateValues[prevKey]?.value
                       : undefined;
 
                     const valueColorClass = dv
@@ -482,7 +675,7 @@ export function MasterTable({
                       : "";
 
                     return (
-                      <Fragment key={date}>
+                      <Fragment key={dateKey}>
                         <td
                           className={cn(
                             "px-3 py-3 text-center font-mono text-sm transition-colors",

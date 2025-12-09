@@ -17,6 +17,8 @@ interface RawRow {
 interface ParsedFile {
   firstDate: string;
   secondDate: string;
+  firstAsOnCol: string;
+  secondAsOnCol: string;
   rows: Array<{
     dpid: string;
     clientId: string;
@@ -66,13 +68,10 @@ export async function parseXLSXFile(file: File): Promise<ParsedFile | null> {
         }
 
         const headers = Object.keys(jsonData[0] ?? {});
-
-        // Case-insensitive AS ON detection
         const asOnColumns = headers.filter((h) =>
           /^as on/i.test(String(h).trim())
         );
 
-        // Extract dates and sort the AS ON columns by the date inside the header
         const asOnWithDates = asOnColumns
           .map((header) => ({ header, date: extractDateFromHeader(header) }))
           .filter((x): x is { header: string; date: string } => Boolean(x.date))
@@ -107,7 +106,13 @@ export async function parseXLSXFile(file: File): Promise<ParsedFile | null> {
           }))
           .filter((row) => row.name);
 
-        resolve({ firstDate, secondDate, rows });
+        resolve({
+          firstDate,
+          secondDate,
+          firstAsOnCol,
+          secondAsOnCol,
+          rows,
+        });
       } catch (error) {
         console.error("Error parsing XLSX:", error);
         reject(error);
@@ -127,32 +132,58 @@ export function consolidateData(parsedFiles: ParsedFile[]): {
     return { holdings: [], dates: [] };
   }
 
-  // Build unique union of all dates across all files
-  const dateSet = new Set<string>();
-  parsedFiles.forEach((f) => {
-    dateSet.add(f.firstDate);
-    dateSet.add(f.secondDate);
-  });
-
-  const dates = Array.from(dateSet).sort(
-    (a, b) => parseDate(a).getTime() - parseDate(b).getTime()
-  );
-
-  // Sort files by their secondDate so later snapshots apply in order
+  // Sort files by their secondDate so timeline flows logically.
   const sortedFiles = [...parsedFiles].sort(
     (a, b) =>
       parseDate(a.secondDate).getTime() - parseDate(b.secondDate).getTime()
   );
 
+  /**
+   * Build column instances (2 per file).
+   * Each instance gets a unique key so duplicates of the same base date are preserved.
+   */
+  const columns: Array<{
+    key: string;
+    baseDate: string;
+    fileIndex: number;
+    pos: 1 | 2;
+  }> = [];
+
+  sortedFiles.forEach((f, i) => {
+    const key1 = `${f.firstDate}@@${i}-1`;
+    const key2 = `${f.secondDate}@@${i}-2`;
+
+    columns.push({ key: key1, baseDate: f.firstDate, fileIndex: i, pos: 1 });
+    columns.push({ key: key2, baseDate: f.secondDate, fileIndex: i, pos: 2 });
+  });
+
+  // Sort column instances by base date, then by file order, then position.
+  columns.sort((a, b) => {
+    const d = parseDate(a.baseDate).getTime() - parseDate(b.baseDate).getTime();
+    if (d !== 0) return d;
+    if (a.fileIndex !== b.fileIndex) return a.fileIndex - b.fileIndex;
+    return a.pos - b.pos;
+  });
+
+  const dates = columns.map((c) => c.key);
   const holdingsMap = new Map<string, HoldingRecord>();
 
-  for (const file of sortedFiles) {
-    for (const row of file.rows) {
-      const key = `${row.dpid}-${row.clientId}-${row.name}`;
+  // Precompute each file's two keys for usage in row mapping.
+  const fileKeys = sortedFiles.map((f, i) => ({
+    firstKey: `${f.firstDate}@@${i}-1`,
+    secondKey: `${f.secondDate}@@${i}-2`,
+  }));
 
-      if (!holdingsMap.has(key)) {
-        holdingsMap.set(key, {
-          id: key,
+  for (let i = 0; i < sortedFiles.length; i++) {
+    const file = sortedFiles[i];
+    const { firstKey, secondKey } = fileKeys[i];
+
+    for (const row of file.rows) {
+      const rowKey = `${row.dpid}-${row.clientId}-${row.name}`;
+
+      if (!holdingsMap.has(rowKey)) {
+        holdingsMap.set(rowKey, {
+          id: rowKey,
           dpid: row.dpid,
           clientId: row.clientId,
           name: row.name,
@@ -161,24 +192,22 @@ export function consolidateData(parsedFiles: ParsedFile[]): {
         });
       }
 
-      const holding = holdingsMap.get(key)!;
+      const holding = holdingsMap.get(rowKey)!;
 
-      // 1) First date snapshot (no bought/sold attributed here)
-      const existingFirst = holding.dateValues[file.firstDate];
-      holding.dateValues[file.firstDate] = {
+      // First AS ON column for this file (no bought/sold attributed here)
+      holding.dateValues[firstKey] = {
         value: row.firstValue,
-        bought: existingFirst?.bought ?? 0,
-        sold: existingFirst?.sold ?? 0,
+        bought: 0,
+        sold: 0,
       };
 
-      // 2) Second date snapshot (bought/sold belongs to this file's period)
-      holding.dateValues[file.secondDate] = {
+      // Second AS ON column for this file (bought/sold belong to this period)
+      holding.dateValues[secondKey] = {
         value: row.secondValue,
         bought: row.bought,
         sold: row.sold,
       };
 
-      // Update category if it's set
       if (row.category) {
         holding.category = row.category;
       }
