@@ -1,12 +1,193 @@
-// Update this page (the content is just a fallback if you fail to update the page)
+import { useState, useEffect } from 'react';
+import { Database, Upload, BarChart3 } from 'lucide-react';
+import { FileUpload } from '@/components/FileUpload';
+import { MasterTable } from '@/components/MasterTable';
+import { parseXLSXFile, consolidateData } from '@/lib/xlsxParser';
+import { saveHoldings, getHoldings, clearAllData, HoldingRecord } from '@/lib/db';
+import { toast } from 'sonner';
 
 const Index = () => {
-  return (
-    <div className="flex min-h-screen items-center justify-center bg-background">
-      <div className="text-center">
-        <h1 className="mb-4 text-4xl font-bold">Welcome to Your Blank App</h1>
-        <p className="text-xl text-muted-foreground">Start building your amazing project here!</p>
+  const [holdings, setHoldings] = useState<HoldingRecord[]>([]);
+  const [dates, setDates] = useState<string[]>([]);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
+
+  // Load data from IndexedDB on mount
+  useEffect(() => {
+    const loadData = async () => {
+      try {
+        const { holdings: savedHoldings, dates: savedDates } = await getHoldings();
+        setHoldings(savedHoldings);
+        setDates(savedDates);
+      } catch (error) {
+        console.error('Error loading data:', error);
+      } finally {
+        setIsLoading(false);
+      }
+    };
+    loadData();
+  }, []);
+
+  const handleFilesSelected = async (files: File[]) => {
+    setIsProcessing(true);
+    
+    try {
+      const parsedFiles = [];
+      
+      for (const file of files) {
+        const parsed = await parseXLSXFile(file);
+        if (parsed) {
+          parsedFiles.push(parsed);
+        }
+      }
+      
+      if (parsedFiles.length === 0) {
+        toast.error('No valid data found in the uploaded files');
+        return;
+      }
+      
+      const { holdings: newHoldings, dates: newDates } = consolidateData(parsedFiles);
+      
+      // Save to IndexedDB
+      await saveHoldings(newHoldings, newDates);
+      
+      setHoldings(newHoldings);
+      setDates(newDates);
+      
+      toast.success(`Successfully processed ${parsedFiles.length} file(s) with ${newHoldings.length} unique records`);
+    } catch (error) {
+      console.error('Error processing files:', error);
+      toast.error('Error processing files. Please check the format.');
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const handleClearData = async () => {
+    try {
+      await clearAllData();
+      setHoldings([]);
+      setDates([]);
+      toast.success('All data cleared successfully');
+    } catch (error) {
+      console.error('Error clearing data:', error);
+      toast.error('Error clearing data');
+    }
+  };
+
+  if (isLoading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-background">
+        <div className="animate-pulse-soft text-primary">
+          <Database className="w-12 h-12" />
+        </div>
       </div>
+    );
+  }
+
+  const hasData = holdings.length > 0;
+
+  return (
+    <div className="min-h-screen bg-background">
+      {/* Header */}
+      <header className="border-b border-border/50 bg-card/50 backdrop-blur-sm sticky top-0 z-50">
+        <div className="container mx-auto px-4 py-4">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <div className="p-2 rounded-xl gradient-primary shadow-glow">
+                <BarChart3 className="w-6 h-6 text-primary-foreground" />
+              </div>
+              <div>
+                <h1 className="text-xl font-bold text-foreground">Holdings Tracker</h1>
+                <p className="text-xs text-muted-foreground">Track shareholding patterns across dates</p>
+              </div>
+            </div>
+            
+            {hasData && (
+              <button
+                onClick={() => {
+                  setHoldings([]);
+                  setDates([]);
+                }}
+                className="flex items-center gap-2 px-4 py-2 rounded-lg bg-secondary hover:bg-secondary/80 text-sm font-medium transition-colors"
+              >
+                <Upload className="w-4 h-4" />
+                Upload More Files
+              </button>
+            )}
+          </div>
+        </div>
+      </header>
+
+      <main className="container mx-auto px-4 py-8">
+        {!hasData ? (
+          <div className="max-w-4xl mx-auto">
+            {/* Hero Section */}
+            <div className="text-center mb-12 animate-fade-in">
+              <h2 className="text-4xl font-bold mb-4">
+                <span className="text-gradient">Track Shareholding</span>
+                <br />
+                <span className="text-foreground">Patterns Over Time</span>
+              </h2>
+              <p className="text-lg text-muted-foreground max-w-2xl mx-auto">
+                Upload multiple XLSX files to consolidate shareholding data, 
+                track bought/sold quantities, and analyze patterns across dates.
+              </p>
+            </div>
+
+            {/* Features */}
+            <div className="grid md:grid-cols-3 gap-6 mb-12">
+              {[
+                {
+                  icon: Upload,
+                  title: 'Bulk Upload',
+                  description: 'Upload multiple XLSX files at once for quick data consolidation',
+                },
+                {
+                  icon: Database,
+                  title: 'Local Storage',
+                  description: 'All data stored securely in your browser using IndexedDB',
+                },
+                {
+                  icon: BarChart3,
+                  title: 'Smart Analysis',
+                  description: 'Search, filter, and sort across all columns and dates',
+                },
+              ].map((feature, i) => (
+                <div
+                  key={feature.title}
+                  className="p-6 rounded-2xl glass shadow-card animate-slide-up"
+                  style={{ animationDelay: `${i * 100}ms` }}
+                >
+                  <div className="p-3 rounded-xl bg-primary/10 w-fit mb-4">
+                    <feature.icon className="w-6 h-6 text-primary" />
+                  </div>
+                  <h3 className="font-semibold text-foreground mb-2">{feature.title}</h3>
+                  <p className="text-sm text-muted-foreground">{feature.description}</p>
+                </div>
+              ))}
+            </div>
+
+            {/* Upload Section */}
+            <FileUpload onFilesSelected={handleFilesSelected} isProcessing={isProcessing} />
+
+            {/* Format Info */}
+            <div className="mt-12 p-6 rounded-2xl bg-secondary/30 border border-border/50">
+              <h4 className="font-semibold text-foreground mb-3">Expected File Format</h4>
+              <div className="overflow-x-auto">
+                <code className="text-xs text-muted-foreground font-mono block whitespace-pre">
+{`SNo | DPID | CLIENT-ID | NAME | SECOND | THIRD | AS ON 02-12-2025 | BOUGHT | SOLD | AS ON 03-12-2025 | CATEGORY`}
+                </code>
+              </div>
+              <p className="text-sm text-muted-foreground mt-3">
+                Each file should contain the columns above. The "AS ON" date columns will be automatically detected and merged chronologically.
+              </p>
+            </div>
+          </div>
+        ) : (
+          <MasterTable holdings={holdings} dates={dates} onClearData={handleClearData} />
+        )}
+      </main>
     </div>
   );
 };
