@@ -17,6 +17,7 @@ import {
   HoldingRecord,
 } from "@/lib/db";
 import { toast } from "sonner";
+import { cn } from "@/lib/utils";
 
 const Index = () => {
   const [holdings, setHoldings] = useState<HoldingRecord[]>([]);
@@ -103,20 +104,25 @@ const Index = () => {
   const hasData = holdings.length > 0;
 
   return (
-    <div className="min-h-screen bg-background">
+    <div className="min-h-screen bg-background flex flex-col">
       <header className="border-b border-border bg-card shadow-enterprise sticky top-0 z-50">
         <div className="container mx-auto px-4 py-4">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
-              <div className="p-2.5 rounded-xl gradient-primary shadow-enterprise-md">
-                <TrendingUp className="w-6 h-6 text-primary-foreground" />
+              <div className="p-2 rounded-xl bg-card border border-border shadow-enterprise-md">
+                <img
+                  src="/l.png"
+                  alt="PESA logo"
+                  className="w-10 h-10 object-contain"
+                  draggable={false}
+                />
               </div>
               <div>
                 <h1 className="text-xl font-bold text-foreground tracking-tight">
                   PESA
                 </h1>
                 <p className="text-xs text-muted-foreground">
-                  Portfolio & Equity Shareholding Analyzer
+                  Premier Energies Stock Analysis
                 </p>
               </div>
             </div>
@@ -231,6 +237,34 @@ const Index = () => {
           />
         )}
       </main>
+
+      <footer className="mt-auto border-t border-border bg-card">
+        <div
+          className={cn("container mx-auto px-4 py-6", hasData && "max-w-none")}
+        >
+          <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <img
+                src="/l.png"
+                alt="PESA"
+                className="w-6 h-6 object-contain"
+                draggable={false}
+              />
+              <span className="text-sm font-semibold text-foreground">
+                PESA
+              </span>
+              <span className="text-xs text-muted-foreground">
+                Premier Energies Stock Analysis
+              </span>
+            </div>
+
+            <div className="text-xs text-muted-foreground">
+              Built for fast, local, secure shareholding analysis • Data stays
+              in your browser (IndexedDB)
+            </div>
+          </div>
+        </div>
+      </footer>
     </div>
   );
 };
