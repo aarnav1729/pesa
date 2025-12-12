@@ -1,4 +1,12 @@
-import { useState, useMemo, Fragment, ReactNode, useRef } from "react";
+import {
+  useState,
+  useMemo,
+  Fragment,
+  ReactNode,
+  useRef,
+  useEffect,
+  useDeferredValue,
+} from "react";
 import { createPortal } from "react-dom";
 import {
   Search,
@@ -36,6 +44,24 @@ type SortConfig = {
   direction: "asc" | "desc";
 } | null;
 
+type SummaryTypeFilter = "all" | "buyers" | "sellers";
+type SummarySortKey =
+  | "initialHolding"
+  | "bought"
+  | "sold"
+  | "net"
+  | "stillHolding";
+
+type SummaryFieldKey = "dpid" | "clientId" | "category" | "name";
+type MatrixFieldKey = "dpid" | "clientId" | "category" | "name";
+
+type FileGroup = {
+  fileIndex: number;
+  dateKeys: string[];
+};
+
+const PAGE_SIZE_OPTIONS = [50, 100, 200, 500, 1000];
+
 /** Extract base date from a dateKey like "03-12-2025@@1-1" */
 function getBaseDate(dateKey: string): string {
   return String(dateKey).split("@@")[0] || dateKey;
@@ -52,6 +78,16 @@ function parseDate(dateStr: string): Date {
     );
   }
   return new Date(0);
+}
+
+/** Extract fileIndex from dateKey like "03-12-2025@@1-2" */
+function getFileIndexFromDateKey(dateKey: string): number | null {
+  const parts = String(dateKey).split("@@");
+  if (parts.length < 2) return null;
+  const meta = parts[1]; // e.g. "1-2"
+  const idxStr = meta.split("-")[0];
+  const idx = Number(idxStr);
+  return Number.isNaN(idx) ? null : idx;
 }
 
 function getValueColorClass(
@@ -81,10 +117,64 @@ function getBuySellColorClass(bought: number, sold: number): string {
   return "";
 }
 
-type SummaryTypeFilter = "all" | "buyers" | "sellers";
-type SummarySortKey = "bought" | "sold" | "net" | "stillHolding";
+/** Name normalizer: trim periods and then whitespaces (leading/trailing). */
+function normalizeName(name: string): string {
+  if (!name) return "";
+  let n = String(name);
 
-/** Small inline hover info tooltip without external deps */
+  // First trim whitespace
+  n = n.trim();
+  // Then trim leading periods + surrounding whitespace
+  n = n.replace(/^[.\s]+/, "");
+  // Then trim trailing periods + surrounding whitespace
+  n = n.replace(/[.\s]+$/, "");
+  // Final whitespace trim
+  n = n.trim();
+
+  return n;
+}
+
+/** Combine duplicate holdings by normalized (DPID + CLIENT-ID + NAME). */
+function combineHoldings(raw: HoldingRecord[]): HoldingRecord[] {
+  const map = new Map<string, HoldingRecord>();
+
+  for (const h of raw) {
+    const normalized = normalizeName(h.name);
+    const key = `${h.dpid}|${h.clientId}|${normalized}`;
+
+    const existing = map.get(key);
+
+    if (!existing) {
+      // Clone to avoid mutating the original
+      map.set(key, {
+        ...h,
+        id: key,
+        name: normalized,
+        dateValues: { ...h.dateValues },
+      });
+    } else {
+      // Merge into existing
+      for (const [dateKey, dv] of Object.entries(h.dateValues)) {
+        const existingDV = existing.dateValues[dateKey];
+        if (existingDV) {
+          existingDV.value += dv.value;
+          existingDV.bought += dv.bought;
+          existingDV.sold += dv.sold;
+        } else {
+          existing.dateValues[dateKey] = { ...dv };
+        }
+      }
+
+      // Prefer non-empty category
+      if (!existing.category && h.category) {
+        existing.category = h.category;
+      }
+    }
+  }
+
+  return Array.from(map.values());
+}
+
 /** Small inline hover info tooltip rendered in a portal (never clipped) */
 function InfoHint({ content }: { content: ReactNode }) {
   const triggerRef = useRef<HTMLSpanElement | null>(null);
@@ -136,13 +226,10 @@ function InfoHint({ content }: { content: ReactNode }) {
 
   const onBlur = () => setOpen(false);
 
-  // Reposition on scroll/resize while open
   const attachWindowListeners = open;
 
   if (attachWindowListeners && typeof window !== "undefined") {
-    // lightweight passive listeners
     window.requestAnimationFrame(() => {
-      // Avoid repeated layout thrash by computing once per frame
       computePos();
     });
   }
@@ -242,19 +329,120 @@ function SectionHeader({
   );
 }
 
+/** Simple reusable pagination controls */
+function PaginationControls({
+  page,
+  totalPages,
+  pageSize,
+  onPageChange,
+  onPageSizeChange,
+  pageSizeOptions = PAGE_SIZE_OPTIONS,
+}: {
+  page: number;
+  totalPages: number;
+  pageSize: number;
+  onPageChange: (page: number) => void;
+  onPageSizeChange: (size: number) => void;
+  pageSizeOptions?: number[];
+}) {
+  const canPrev = page > 1;
+  const canNext = page < totalPages;
+
+  return (
+    <div className="flex items-center gap-3 text-xs">
+      <div className="flex items-center gap-1">
+        <span className="text-muted-foreground">Rows per page:</span>
+        <select
+          className="h-7 rounded-md bg-background text-xs border border-border px-2"
+          value={pageSize}
+          onChange={(e) => onPageSizeChange(Number(e.target.value))}
+        >
+          {pageSizeOptions.map((opt) => (
+            <option key={opt} value={opt}>
+              {opt}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      <div className="flex items-center gap-1 text-muted-foreground">
+        <span>
+          Page <span className="text-foreground font-medium">{page}</span> of{" "}
+          <span className="text-foreground font-medium">{totalPages}</span>
+        </span>
+        <Button
+          variant="outline"
+          size="icon"
+          className="h-7 w-7"
+          disabled={!canPrev}
+          onClick={() => canPrev && onPageChange(page - 1)}
+        >
+          {"<"}
+        </Button>
+        <Button
+          variant="outline"
+          size="icon"
+          className="h-7 w-7"
+          disabled={!canNext}
+          onClick={() => canNext && onPageChange(page + 1)}
+        >
+          {">"}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 export function MasterTable({
   holdings,
   dates,
   onClearData,
 }: MasterTableProps) {
+  // ---------------- Normalized / combined holdings ----------------
+  const combinedHoldings = useMemo(() => combineHoldings(holdings), [holdings]);
+
+  const [isClearing, setIsClearing] = useState(false);
+  const [isExportingXlsx, setIsExportingXlsx] = useState(false);
+
+  // Map of id -> {value, dateBase} for "Initial Holding"
+  const initialHoldingMap = useMemo(() => {
+    const map = new Map<string, { value: number; dateBase: string }>();
+
+    for (const h of combinedHoldings) {
+      let initialValue = 0;
+      let initialDateBase = "";
+
+      for (const dk of dates) {
+        const dv = h.dateValues[dk];
+        if (dv) {
+          initialValue = dv.value;
+          initialDateBase = getBaseDate(dk);
+          break;
+        }
+      }
+
+      map.set(h.id, { value: initialValue, dateBase: initialDateBase });
+    }
+
+    return map;
+  }, [combinedHoldings, dates]);
+
   // ---------------- Collapsible states (default collapsed) ----------------
   const [summaryOpen, setSummaryOpen] = useState(false);
   const [matrixOpen, setMatrixOpen] = useState(false);
 
   // ---------------- Main matrix state ----------------
   const [searchTerm, setSearchTerm] = useState("");
+  const deferredSearchTerm = useDeferredValue(searchTerm);
+
   const [sortConfig, setSortConfig] = useState<SortConfig>(null);
-  const [filters, setFilters] = useState<Record<string, string>>({});
+  const [filters, setFilters] = useState<Record<MatrixFieldKey, string>>({
+    dpid: "",
+    clientId: "",
+    category: "",
+    name: "",
+  });
+
   const [dateOrder, setDateOrder] = useState<"asc" | "desc">("asc");
 
   // ---------------- Summary-only state ----------------
@@ -264,18 +452,23 @@ export function MasterTable({
   const [summaryFromBase, setSummaryFromBase] = useState<string>("");
   const [summaryToBase, setSummaryToBase] = useState<string>("");
 
-  // ---------------- Derived dates ----------------
-  const orderedDates = useMemo(() => {
-    return dateOrder === "asc" ? dates : [...dates].reverse();
-  }, [dates, dateOrder]);
+  // NEW: Excel-like filters for DPID / ClientID / Category / Name in summary
+  const [summaryFieldFilters, setSummaryFieldFilters] = useState<
+    Record<SummaryFieldKey, string>
+  >({
+    dpid: "",
+    clientId: "",
+    category: "",
+    name: "",
+  });
 
+  // ---------------- Derived dates for summary ----------------
   const baseDatesSorted = useMemo(() => {
     const uniq = Array.from(new Set(dates.map(getBaseDate)));
     uniq.sort((a, b) => parseDate(a).getTime() - parseDate(b).getTime());
     return uniq;
   }, [dates]);
 
-  // Initialize default summary range (first -> last) when dates arrive.
   const effectiveSummaryFrom = summaryFromBase || baseDatesSorted[0] || "";
   const effectiveSummaryTo =
     summaryToBase || baseDatesSorted[baseDatesSorted.length - 1] || "";
@@ -304,21 +497,59 @@ export function MasterTable({
     });
   }, [dates, normalizedRange.from, normalizedRange.to]);
 
+  // ---------------- File groups for master matrix (per sheet) ----------------
+  const fileGroupsAsc = useMemo<FileGroup[]>(() => {
+    if (!dates.length) return [];
+    const grouped = new Map<number, string[]>();
+
+    for (const dk of dates) {
+      const fi = getFileIndexFromDateKey(dk);
+      const key = fi ?? -1;
+      const existing = grouped.get(key);
+      if (existing) {
+        existing.push(dk);
+      } else {
+        grouped.set(key, [dk]);
+      }
+    }
+
+    // Sort groups by fileIndex (ascending), and within each group by base date
+    const sortedKeys = Array.from(grouped.keys()).sort((a, b) => a - b);
+    const groups: FileGroup[] = sortedKeys.map((fi) => {
+      const arr = grouped.get(fi)!;
+      arr.sort(
+        (a, b) =>
+          parseDate(getBaseDate(a)).getTime() -
+          parseDate(getBaseDate(b)).getTime()
+      );
+      return { fileIndex: fi, dateKeys: arr };
+    });
+
+    return groups;
+  }, [dates]);
+
+  const fileGroups = useMemo<FileGroup[]>(() => {
+    return dateOrder === "asc" ? fileGroupsAsc : [...fileGroupsAsc].reverse();
+  }, [fileGroupsAsc, dateOrder]);
+
   // ---------------- Unique values for main matrix filters ----------------
   const uniqueValues = useMemo(() => {
     return {
-      dpid: [...new Set(holdings.map((h) => h.dpid))],
-      clientId: [...new Set(holdings.map((h) => h.clientId))],
-      category: [...new Set(holdings.map((h) => h.category))].filter(Boolean),
+      dpid: [...new Set(combinedHoldings.map((h) => h.dpid))],
+      clientId: [...new Set(combinedHoldings.map((h) => h.clientId))],
+      category: [...new Set(combinedHoldings.map((h) => h.category))].filter(
+        Boolean
+      ),
+      name: [...new Set(combinedHoldings.map((h) => h.name).filter(Boolean))],
     };
-  }, [holdings]);
+  }, [combinedHoldings]);
 
   // ---------------- Main matrix filtering/sorting ----------------
   const filteredData = useMemo(() => {
-    let result = [...holdings];
+    let result = [...combinedHoldings];
 
-    if (searchTerm) {
-      const term = searchTerm.toLowerCase();
+    if (deferredSearchTerm) {
+      const term = deferredSearchTerm.toLowerCase();
       result = result.filter(
         (h) =>
           h.name.toLowerCase().includes(term) ||
@@ -329,14 +560,24 @@ export function MasterTable({
     }
 
     Object.entries(filters).forEach(([key, value]) => {
-      if (value) {
-        result = result.filter((h) => {
-          if (key === "dpid") return h.dpid === value;
-          if (key === "clientId") return h.clientId === value;
-          if (key === "category") return h.category === value;
-          return true;
-        });
-      }
+      if (!value) return;
+      const lower = value.toLowerCase();
+
+      result = result.filter((h) => {
+        if (key === "dpid") {
+          return h.dpid.toLowerCase().includes(lower);
+        }
+        if (key === "clientId") {
+          return h.clientId.toLowerCase().includes(lower);
+        }
+        if (key === "category") {
+          return h.category ? h.category.toLowerCase().includes(lower) : false;
+        }
+        if (key === "name") {
+          return h.name.toLowerCase().includes(lower);
+        }
+        return true;
+      });
     });
 
     if (sortConfig) {
@@ -356,6 +597,11 @@ export function MasterTable({
         } else if (sortConfig.key === "category") {
           aVal = a.category;
           bVal = b.category;
+        } else if (sortConfig.key === "initialHolding") {
+          const ai = initialHoldingMap.get(a.id)?.value ?? 0;
+          const bi = initialHoldingMap.get(b.id)?.value ?? 0;
+          aVal = ai;
+          bVal = bi;
         } else if (sortConfig.key.startsWith("date-")) {
           const dateKey = sortConfig.key.replace("date-", "");
           aVal = a.dateValues[dateKey]?.value || 0;
@@ -371,7 +617,33 @@ export function MasterTable({
     }
 
     return result;
-  }, [holdings, searchTerm, sortConfig, filters]);
+  }, [
+    combinedHoldings,
+    deferredSearchTerm,
+    sortConfig,
+    filters,
+    initialHoldingMap,
+  ]);
+
+  // ---------------- Matrix pagination ----------------
+  const [matrixPageSize, setMatrixPageSize] = useState(200);
+  const [matrixPage, setMatrixPage] = useState(1);
+
+  const matrixTotalPages = useMemo(
+    () => Math.max(1, Math.ceil((filteredData.length || 0) / matrixPageSize)),
+    [filteredData.length, matrixPageSize]
+  );
+
+  useEffect(() => {
+    // reset to first page when data or size changes
+    setMatrixPage(1);
+  }, [matrixPageSize, filteredData.length]);
+
+  const matrixPageRows = useMemo(() => {
+    if (filteredData.length === 0) return [];
+    const start = (matrixPage - 1) * matrixPageSize;
+    return filteredData.slice(start, start + matrixPageSize);
+  }, [filteredData, matrixPage, matrixPageSize]);
 
   const handleSort = (key: string) => {
     setSortConfig((prev) => {
@@ -394,67 +666,172 @@ export function MasterTable({
     );
   };
 
-  const FilterButton = ({
+  const MatrixFilterButton = ({
     columnKey,
+    label,
     values,
   }: {
-    columnKey: string;
+    columnKey: MatrixFieldKey;
+    label: string;
     values: string[];
-  }) => (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <button
-          className={cn(
-            "p-1 rounded hover:bg-muted transition-colors",
-            filters[columnKey] && "text-primary bg-primary/10"
-          )}
-        >
-          <Filter className="w-3 h-3" />
-        </button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="start" className="max-h-64 overflow-y-auto">
-        <DropdownMenuItem
-          onClick={() => setFilters((f) => ({ ...f, [columnKey]: "" }))}
-        >
-          <span className="text-muted-foreground">Clear filter</span>
-        </DropdownMenuItem>
-        {values.map((value) => (
-          <DropdownMenuItem
-            key={value}
-            onClick={() => setFilters((f) => ({ ...f, [columnKey]: value }))}
-          >
-            {value}
-          </DropdownMenuItem>
-        ))}
-      </DropdownMenuContent>
-    </DropdownMenu>
-  );
+  }) => {
+    const currentValue = filters[columnKey] || "";
 
-  const exportToCSV = () => {
-    const headers = ["DPID", "CLIENT-ID", "CATEGORY", "NAME"];
-    orderedDates.forEach((dateKey) => {
-      headers.push(`AS ON ${getBaseDate(dateKey)}`);
-      headers.push("BOUGHT/SOLD");
+    const visibleOptions = values.filter((opt) =>
+      currentValue
+        ? opt.toLowerCase().includes(currentValue.toLowerCase())
+        : true
+    );
+
+    return (
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <button
+            className={cn(
+              "p-1 rounded hover:bg-muted transition-colors",
+              currentValue && "text-primary bg-primary/10"
+            )}
+            title={`Filter ${label}`}
+          >
+            <Filter className="w-3 h-3" />
+          </button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent
+          align="start"
+          className="w-48 max-h-72 overflow-hidden p-0"
+        >
+          {/* Search box */}
+          <div className="p-2 border-b border-border">
+            <Input
+              autoFocus
+              placeholder={`Search ${label}`}
+              value={currentValue}
+              onChange={(e) =>
+                setFilters((prev) => ({
+                  ...prev,
+                  [columnKey]: e.target.value,
+                }))
+              }
+              className="h-7 text-xs"
+            />
+          </div>
+
+          {/* Clear filter */}
+          <DropdownMenuItem
+            onClick={() =>
+              setFilters((prev) => ({
+                ...prev,
+                [columnKey]: "",
+              }))
+            }
+          >
+            <span className="text-muted-foreground text-xs">Clear filter</span>
+          </DropdownMenuItem>
+
+          {/* Values list */}
+          <div className="max-h-52 overflow-y-auto">
+            {visibleOptions.length === 0 && (
+              <div className="px-3 py-2 text-xs text-muted-foreground">
+                No matches
+              </div>
+            )}
+            {visibleOptions.map((opt) => (
+              <DropdownMenuItem
+                key={opt}
+                onClick={() =>
+                  setFilters((prev) => ({
+                    ...prev,
+                    [columnKey]: opt,
+                  }))
+                }
+              >
+                <span className="text-xs">{opt}</span>
+              </DropdownMenuItem>
+            ))}
+          </div>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    );
+  };
+
+  // ---------------- Export helpers (mirror sheet grouping) ----------------
+  const buildExportMatrix = () => {
+    const headers: string[] = [
+      "DPID",
+      "CLIENT-ID",
+      "CATEGORY",
+      "NAME",
+      "INITIAL HOLDING",
+    ];
+
+    fileGroups.forEach((group, groupIndex) => {
+      const firstKey = group.dateKeys[0];
+      const secondKey = group.dateKeys[1];
+
+      const firstBase = firstKey ? getBaseDate(firstKey) : "";
+      const secondBase = secondKey ? getBaseDate(secondKey) : "";
+
+      headers.push(
+        firstBase ? `AS ON ${firstBase}` : `FILE ${groupIndex + 1} HOLDING 1`
+      );
+      headers.push("B/S");
+      headers.push(
+        secondBase ? `AS ON ${secondBase}` : `FILE ${groupIndex + 1} HOLDING 2`
+      );
     });
 
     const rows = filteredData.map((h) => {
-      const row = [h.dpid, h.clientId, h.category, h.name];
-      orderedDates.forEach((dateKey) => {
-        const dv = h.dateValues[dateKey];
-        row.push(String(dv?.value || 0));
-        const boughtSold = dv
-          ? (dv.bought > 0 ? `+${dv.bought}` : "") +
-            (dv.sold > 0 ? `-${dv.sold}` : "")
-          : "";
-        row.push(boughtSold || "-");
+      const initialInfo = initialHoldingMap.get(h.id);
+      const row: (string | number)[] = [
+        h.dpid,
+        h.clientId,
+        h.category,
+        h.name,
+        initialInfo?.value ?? 0,
+      ];
+
+      fileGroups.forEach((group, groupIndex) => {
+        const firstKey = group.dateKeys[0];
+        const secondKey = group.dateKeys[1];
+
+        const dv1 = firstKey ? h.dateValues[firstKey] : undefined;
+        const dv2 = secondKey ? h.dateValues[secondKey] : undefined;
+
+        row.push(dv1?.value ?? 0);
+
+        if (dv2) {
+          const bs =
+            (dv2.bought > 0 ? `+${dv2.bought}` : "") +
+            (dv2.sold > 0 ? `-${dv2.sold}` : "");
+          row.push(bs || "-");
+        } else {
+          row.push("-");
+        }
+
+        row.push(dv2?.value ?? 0);
       });
+
       return row;
     });
 
+    return { headers, rows };
+  };
+
+  const exportToCSV = () => {
+    const { headers, rows } = buildExportMatrix();
     const csvContent = [
       headers.join(","),
-      ...rows.map((r) => r.join(",")),
+      ...rows.map((r) =>
+        r
+          .map((cell) =>
+            typeof cell === "string" && cell.includes(",")
+              ? `"${cell.replace(/"/g, '""')}"`
+              : String(cell)
+          )
+          .join(",")
+      ),
     ].join("\n");
+
     const blob = new Blob([csvContent], { type: "text/csv" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -464,8 +841,69 @@ export function MasterTable({
     URL.revokeObjectURL(url);
   };
 
+  const exportToXLSX = async () => {
+    try {
+      setIsExportingXlsx(true);
+
+      const resp = await fetch("/api/pesa/export/xlsx", {
+        method: "GET",
+      });
+
+      if (!resp.ok) {
+        throw new Error(`Server responded with ${resp.status}`);
+      }
+
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "pesa-export.xlsx";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error("Failed to export XLSX:", err);
+      alert("Failed to export XLSX from server. Check console for details.");
+    } finally {
+      setIsExportingXlsx(false);
+    }
+  };
+
   const toggleDateOrder = () => {
     setDateOrder((o) => (o === "asc" ? "desc" : "asc"));
+  };
+
+  const handleClearDataClick = async () => {
+    const confirmed = window.confirm(
+      "This will clear all imported PESA data from the server and this browser. Continue?"
+    );
+    if (!confirmed) return;
+
+    try {
+      setIsClearing(true);
+
+      const resp = await fetch("/api/pesa/clear", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+      });
+
+      if (!resp.ok) {
+        throw new Error(`Server responded with ${resp.status}`);
+      }
+
+      // Clear local/IndexedDB via parent callback
+      onClearData();
+    } catch (err) {
+      console.error("Failed to clear PESA data:", err);
+      alert("Failed to clear data on server. Check console for details.");
+    } finally {
+      setIsClearing(false);
+    }
   };
 
   // ---------------- Latest date key (global) ----------------
@@ -511,6 +949,8 @@ export function MasterTable({
       const stillHolding = latestDateKey
         ? h.dateValues[latestDateKey]?.value ?? 0
         : 0;
+      const initialInfo = initialHoldingMap.get(h.id);
+      const initialHolding = initialInfo?.value ?? 0;
 
       return {
         id: h.id,
@@ -518,23 +958,58 @@ export function MasterTable({
         clientId: h.clientId,
         category: h.category,
         name: h.name,
+        initialHolding,
         bought: totalBought,
         sold: totalSold,
         net,
         stillHolding,
       };
     });
-  }, [filteredData, dateKeysInSummaryRange, latestDateKey]);
+  }, [filteredData, dateKeysInSummaryRange, latestDateKey, initialHoldingMap]);
+
+  // Unique values for summary header filters (from visible summary base data)
+  const summaryUniqueValues = useMemo(
+    () => ({
+      dpid: [...new Set(rawSummaryRows.map((r) => r.dpid))],
+      clientId: [...new Set(rawSummaryRows.map((r) => r.clientId))],
+      category: [
+        ...new Set(rawSummaryRows.map((r) => r.category).filter(Boolean)),
+      ] as string[],
+      name: [
+        ...new Set(rawSummaryRows.map((r) => r.name).filter(Boolean)),
+      ] as string[],
+    }),
+    [rawSummaryRows]
+  );
 
   const summaryRows = useMemo(() => {
     let result = [...rawSummaryRows];
 
+    // 1) Apply Excel-like header filters (DPID / ClientID / Category / Name)
+    Object.entries(summaryFieldFilters).forEach(([key, value]) => {
+      if (!value) return;
+      const lower = value.toLowerCase();
+      if (key === "dpid") {
+        result = result.filter((r) => r.dpid.toLowerCase().includes(lower));
+      } else if (key === "clientId") {
+        result = result.filter((r) => r.clientId.toLowerCase().includes(lower));
+      } else if (key === "category") {
+        result = result.filter(
+          (r) => r.category && r.category.toLowerCase().includes(lower)
+        );
+      } else if (key === "name") {
+        result = result.filter((r) => r.name.toLowerCase().includes(lower));
+      }
+    });
+
+    // 2) Buyers / Sellers filter
     if (summaryType === "buyers") {
       result = result.filter((r) => r.bought > 0);
     } else if (summaryType === "sellers") {
       result = result.filter((r) => r.sold > 0);
     }
 
+    // 3) Sort
     result.sort((a, b) => {
       const aVal = a[summarySortKey];
       const bVal = b[summarySortKey];
@@ -545,7 +1020,56 @@ export function MasterTable({
     });
 
     return result;
-  }, [rawSummaryRows, summaryType, summarySortKey, summarySortDir]);
+  }, [
+    rawSummaryRows,
+    summaryType,
+    summarySortKey,
+    summarySortDir,
+    summaryFieldFilters,
+  ]);
+
+  // ---------------- Summary pagination ----------------
+  const [summaryPageSize, setSummaryPageSize] = useState(200);
+  const [summaryPage, setSummaryPage] = useState(1);
+
+  const summaryTotalPages = useMemo(
+    () => Math.max(1, Math.ceil((summaryRows.length || 0) / summaryPageSize)),
+    [summaryRows.length, summaryPageSize]
+  );
+
+  useEffect(() => {
+    setSummaryPage(1);
+  }, [
+    summaryRows.length,
+    summaryPageSize,
+    summaryType,
+    summarySortKey,
+    summarySortDir,
+  ]);
+
+  const summaryPageRows = useMemo(() => {
+    if (summaryRows.length === 0) return [];
+    const start = (summaryPage - 1) * summaryPageSize;
+    return summaryRows.slice(start, start + summaryPageSize);
+  }, [summaryRows, summaryPage, summaryPageSize]);
+
+  const summaryTotals = useMemo(() => {
+    let initial = 0;
+    let bought = 0;
+    let sold = 0;
+    let net = 0;
+    let still = 0;
+
+    for (const r of summaryRows) {
+      initial += r.initialHolding;
+      bought += r.bought;
+      sold += r.sold;
+      net += r.net;
+      still += r.stillHolding;
+    }
+
+    return { initial, bought, sold, net, still };
+  }, [summaryRows]);
 
   const clearSummaryFilters = () => {
     setSummaryType("all");
@@ -553,6 +1077,12 @@ export function MasterTable({
     setSummarySortDir("desc");
     setSummaryFromBase("");
     setSummaryToBase("");
+    setSummaryFieldFilters({
+      dpid: "",
+      clientId: "",
+      category: "",
+      name: "",
+    });
   };
 
   const SummarySortMenu = () => (
@@ -564,13 +1094,19 @@ export function MasterTable({
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end">
-        {(["bought", "sold", "net", "stillHolding"] as SummarySortKey[]).map(
-          (k) => (
-            <DropdownMenuItem key={k} onClick={() => setSummarySortKey(k)}>
-              {k}
-            </DropdownMenuItem>
-          )
-        )}
+        {(
+          [
+            "initialHolding",
+            "bought",
+            "sold",
+            "net",
+            "stillHolding",
+          ] as SummarySortKey[]
+        ).map((k) => (
+          <DropdownMenuItem key={k} onClick={() => setSummarySortKey(k)}>
+            {k}
+          </DropdownMenuItem>
+        ))}
         <DropdownMenuItem
           onClick={() =>
             setSummarySortDir((d) => (d === "asc" ? "desc" : "asc"))
@@ -582,17 +1118,135 @@ export function MasterTable({
     </DropdownMenu>
   );
 
+  const handleSummaryHeaderSort = (key: SummarySortKey) => {
+    setSummarySortKey((prevKey) => {
+      if (prevKey === key) {
+        setSummarySortDir((prevDir) => (prevDir === "asc" ? "desc" : "asc"));
+        return prevKey;
+      }
+      setSummarySortDir("desc");
+      return key;
+    });
+  };
+
+  const SummarySortIcon = ({ columnKey }: { columnKey: SummarySortKey }) => {
+    if (summarySortKey !== columnKey) {
+      return (
+        <ArrowUpDown className="w-3.5 h-3.5 text-muted-foreground inline-block ml-1" />
+      );
+    }
+
+    return summarySortDir === "asc" ? (
+      <ArrowUp className="w-3.5 h-3.5 text-primary inline-block ml-1" />
+    ) : (
+      <ArrowDown className="w-3.5 h-3.5 text-primary inline-block ml-1" />
+    );
+  };
+
+  const SummaryFilterButton = ({
+    columnKey,
+    label,
+  }: {
+    columnKey: SummaryFieldKey;
+    label: string;
+  }) => {
+    const currentValue = summaryFieldFilters[columnKey];
+    const allOptions = summaryUniqueValues[columnKey];
+
+    const visibleOptions = allOptions.filter((opt) =>
+      currentValue
+        ? opt.toLowerCase().includes(currentValue.toLowerCase())
+        : true
+    );
+
+    return (
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <button
+            className={cn(
+              "p-1 rounded hover:bg-muted transition-colors",
+              currentValue && "text-primary bg-primary/10"
+            )}
+            title={`Filter ${label}`}
+          >
+            <Filter className="w-3 h-3" />
+          </button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent
+          align="start"
+          className="w-48 max-h-72 overflow-hidden p-0"
+        >
+          {/* Search box */}
+          <div className="p-2 border-b border-border">
+            <Input
+              autoFocus
+              placeholder={`Search ${label}`}
+              value={currentValue}
+              onChange={(e) =>
+                setSummaryFieldFilters((prev) => ({
+                  ...prev,
+                  [columnKey]: e.target.value,
+                }))
+              }
+              className="h-7 text-xs"
+            />
+          </div>
+
+          {/* Clear filter */}
+          <DropdownMenuItem
+            onClick={() =>
+              setSummaryFieldFilters((prev) => ({ ...prev, [columnKey]: "" }))
+            }
+          >
+            <span className="text-muted-foreground text-xs">Clear filter</span>
+          </DropdownMenuItem>
+
+          {/* Values list */}
+          <div className="max-h-52 overflow-y-auto">
+            {visibleOptions.length === 0 && (
+              <div className="px-3 py-2 text-xs text-muted-foreground">
+                No matches
+              </div>
+            )}
+            {visibleOptions.map((opt) => (
+              <DropdownMenuItem
+                key={opt}
+                onClick={() =>
+                  setSummaryFieldFilters((prev) => ({
+                    ...prev,
+                    [columnKey]: opt,
+                  }))
+                }
+              >
+                <span className="text-xs">{opt}</span>
+              </DropdownMenuItem>
+            ))}
+          </div>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    );
+  };
+
   const summaryInfo = (
     <div className="space-y-2">
       <div className="font-medium text-foreground">What this Summary shows</div>
       <ul className="list-disc pl-4 space-y-1">
+        <li>
+          <span className="text-foreground">Initial Holding</span> is the value
+          on the{" "}
+          <span className="text-foreground">
+            first date where the name appears
+          </span>
+          .
+        </li>
         <li>
           Aggregated <span className="text-foreground">Bought</span> and{" "}
           <span className="text-foreground">Sold</span> totals across the{" "}
           <span className="text-foreground">selected AS ON date range</span>.
         </li>
         <li>
-          <span className="text-foreground">Net</span> = Bought - Sold.
+          <span className="text-foreground">Net B/S</span> = Bought - Sold
+          (netted over the range).
         </li>
         <li>
           <span className="text-foreground">Still Holding</span> uses the{" "}
@@ -605,12 +1259,16 @@ export function MasterTable({
       </div>
       <ul className="list-disc pl-4 space-y-1">
         <li>
+          Click header cells (like in Excel) to sort by Sold, Bought, Initial,
+          Net B/S, or Still Holding.
+        </li>
+        <li>
           <span className="text-foreground">All / Buyers / Sellers</span>{" "}
           filters rows by whether totals have bought/sold &gt; 0.
         </li>
         <li>
-          <span className="text-foreground">Sort</span> changes ordering by
-          Bought/Sold/Net/Still Holding.
+          <span className="text-foreground">Sort menu</span> changes ordering by
+          any summary metric and direction.
         </li>
         <li>
           <span className="text-foreground">Range</span> picks base dates pulled
@@ -631,29 +1289,38 @@ export function MasterTable({
           holdings for each DPID/Client/Name.
         </li>
         <li>
-          Each file contributes{" "}
-          <span className="text-foreground">two AS ON columns</span>.
+          Each uploaded sheet contributes{" "}
+          <span className="text-foreground">
+            three columns: Holding as on first date, B/S, Holding as on second
+            date
+          </span>
+          .
         </li>
         <li>
-          Duplicate dates are preserved using internal keys (e.g.{" "}
-          <span className="text-foreground">03-12-2025 appears twice</span> if
-          it exists across two files).
+          Duplicate entries by name are{" "}
+          <span className="text-foreground">combined</span> after trimming
+          periods and whitespace at the edges.
         </li>
         <li>
           The <span className="text-foreground">B/S column</span> displays
-          bought and sold for that period’s second AS ON snapshot.
+          bought and sold for the sheet (change from the first AS ON to the
+          second AS ON date).
         </li>
         <li>
-          Cell colors show % change vs the previous displayed column instance.
+          Cell colors show % change vs the previous displayed{" "}
+          <span className="text-foreground">holding value</span>.
         </li>
       </ul>
       <div className="font-medium text-foreground mt-2">How to use</div>
       <ul className="list-disc pl-4 space-y-1">
-        <li>Use column header clicks for sorting by that column.</li>
+        <li>
+          Click headers (DPID, Client, Category, Name, Initial, AS ON dates) to
+          sort, similar to Excel.
+        </li>
         <li>Use filter icons on DPID/Client/Category to narrow rows.</li>
         <li>
-          “Reverse Dates” flips visual ordering without modifying underlying
-          data.
+          “Reverse Dates” flips sheet order (rightmost/leftmost) without
+          modifying underlying data.
         </li>
       </ul>
     </div>
@@ -692,23 +1359,27 @@ export function MasterTable({
             <RotateCcw className="w-4 h-4" />
             Reverse Dates
           </Button>
+
           <Button
             variant="outline"
             size="sm"
-            onClick={exportToCSV}
+            onClick={exportToXLSX}
+            disabled={isExportingXlsx}
             className="shadow-enterprise"
           >
             <Download className="w-4 h-4" />
-            Export CSV
+            {isExportingXlsx ? "Exporting XLSX..." : "Export XLSX"}
           </Button>
+
           <Button
             variant="outline"
             size="sm"
-            onClick={onClearData}
+            onClick={handleClearDataClick}
+            disabled={isClearing}
             className="text-destructive hover:text-destructive shadow-enterprise"
           >
             <Trash2 className="w-4 h-4" />
-            Clear Data
+            {isClearing ? "Clearing..." : "Clear Data"}
           </Button>
         </div>
       </div>
@@ -737,7 +1408,7 @@ export function MasterTable({
       )}
 
       {/* Stats */}
-      <div className="flex gap-4 mb-4 text-sm text-muted-foreground">
+      <div className="flex gap-4 mb-4 text-sm text-muted-foreground flex-wrap">
         <span>
           Showing{" "}
           <span className="text-foreground font-semibold">
@@ -745,11 +1416,11 @@ export function MasterTable({
           </span>{" "}
           of{" "}
           <span className="text-foreground font-semibold">
-            {holdings.length}
+            {combinedHoldings.length}
           </span>{" "}
-          records
+          combined records
         </span>
-        <span className="text-border">|</span>
+        <span className="text-border hidden sm:inline-block">|</span>
         <span>
           <span className="text-foreground font-semibold">{dates.length}</span>{" "}
           AS ON columns
@@ -759,7 +1430,7 @@ export function MasterTable({
       {/* ===================== SUMMARY (COLLAPSIBLE) ===================== */}
       <div className="rounded-lg border border-border overflow-hidden shadow-enterprise-md bg-card mb-6">
         <SectionHeader
-          title="Summary (Bought/Sold totals + latest holding)"
+          title="Summary (Initial Holding, Bought/Sold totals, Latest Holding)"
           open={summaryOpen}
           onToggle={() => setSummaryOpen((o) => !o)}
           info={summaryInfo}
@@ -890,34 +1561,123 @@ export function MasterTable({
               <table className="w-full">
                 <thead>
                   <tr className="bg-muted/50 border-b border-border">
+                    {/* DPID */}
                     <th className="px-4 py-2 text-left text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                      DPID
+                      <div className="flex items-center gap-2">
+                        <span>DPID</span>
+                        <SummaryFilterButton columnKey="dpid" label="DPID" />
+                      </div>
                     </th>
+
+                    {/* ClientID */}
                     <th className="px-4 py-2 text-left text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                      ClientID
+                      <div className="flex items-center gap-2">
+                        <span>ClientID</span>
+                        <SummaryFilterButton
+                          columnKey="clientId"
+                          label="Client ID"
+                        />
+                      </div>
                     </th>
+
+                    {/* Category */}
                     <th className="px-4 py-2 text-left text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                      Category
+                      <div className="flex items-center gap-2">
+                        <span>Category</span>
+                        <SummaryFilterButton
+                          columnKey="category"
+                          label="Category"
+                        />
+                      </div>
                     </th>
-                    <th className="px-4 py-2 text-right text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                    {/* Sold */}
+                    <th
+                      className="px-4 py-2 text-right text-xs font-semibold uppercase tracking-wider text-muted-foreground cursor-pointer"
+                      onClick={() => handleSummaryHeaderSort("sold")}
+                    >
                       Sold
+                      <SummarySortIcon columnKey="sold" />
                     </th>
+                    {/* Name */}
                     <th className="px-4 py-2 text-left text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                      Name
+                      <div className="flex items-center gap-2">
+                        <span>Name</span>
+                        <SummaryFilterButton columnKey="name" label="Name" />
+                      </div>
                     </th>
-                    <th className="px-4 py-2 text-right text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+
+                    {/* Bought */}
+                    <th
+                      className="px-4 py-2 text-right text-xs font-semibold uppercase tracking-wider text-muted-foreground cursor-pointer"
+                      onClick={() => handleSummaryHeaderSort("bought")}
+                    >
                       Bought
+                      <SummarySortIcon columnKey="bought" />
                     </th>
-                    <th className="px-4 py-2 text-right text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                      Net
+                    {/* Initial */}
+                    <th
+                      className="px-4 py-2 text-right text-xs font-semibold uppercase tracking-wider text-muted-foreground cursor-pointer"
+                      onClick={() => handleSummaryHeaderSort("initialHolding")}
+                    >
+                      Initial Holding
+                      <SummarySortIcon columnKey="initialHolding" />
                     </th>
-                    <th className="px-4 py-2 text-right text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                    {/* Net B/S */}
+                    <th
+                      className="px-4 py-2 text-right text-xs font-semibold uppercase tracking-wider text-muted-foreground cursor-pointer"
+                      onClick={() => handleSummaryHeaderSort("net")}
+                    >
+                      Net B/S (Bought or Sold)
+                      <SummarySortIcon columnKey="net" />
+                    </th>
+                    {/* Still Holding */}
+                    <th
+                      className="px-4 py-2 text-right text-xs font-semibold uppercase tracking-wider text-muted-foreground cursor-pointer"
+                      onClick={() => handleSummaryHeaderSort("stillHolding")}
+                    >
                       Still Holding
+                      <SummarySortIcon columnKey="stillHolding" />
                     </th>
                   </tr>
                 </thead>
                 <tbody>
-                  {summaryRows.map((r, idx) => (
+                  {/* Totals row */}
+                  {summaryRows.length > 0 && (
+                    <tr className="bg-muted/40 border-b border-border/70">
+                      <td className="px-4 py-2 font-mono text-xs text-muted-foreground"></td>
+                      <td className="px-4 py-2 font-mono text-xs text-muted-foreground"></td>
+                      <td className="px-4 py-2 text-xs text-muted-foreground"></td>
+                      <td className="px-4 py-2 text-right font-mono text-sm text-destructive">
+                        {summaryTotals.sold.toLocaleString()}
+                      </td>
+                      <td className="px-4 py-2 text-sm font-semibold text-foreground">
+                        Total
+                      </td>
+                      <td className="px-4 py-2 text-right font-mono text-sm text-success">
+                        {summaryTotals.bought.toLocaleString()}
+                      </td>
+                      <td className="px-4 py-2 text-right font-mono text-sm">
+                        {summaryTotals.initial.toLocaleString()}
+                      </td>
+                      <td
+                        className={cn(
+                          "px-4 py-2 text-right font-mono text-sm",
+                          summaryTotals.net > 0
+                            ? "text-success"
+                            : summaryTotals.net < 0
+                            ? "text-destructive"
+                            : "text-muted-foreground"
+                        )}
+                      >
+                        {summaryTotals.net.toLocaleString()}
+                      </td>
+                      <td className="px-4 py-2 text-right font-mono text-sm">
+                        {summaryTotals.still.toLocaleString()}
+                      </td>
+                    </tr>
+                  )}
+
+                  {summaryPageRows.map((r, idx) => (
                     <tr
                       key={r.id}
                       className={cn(
@@ -945,6 +1705,9 @@ export function MasterTable({
                       <td className="px-4 py-2 text-right font-mono text-sm text-success">
                         {r.bought.toLocaleString()}
                       </td>
+                      <td className="px-4 py-2 text-right font-mono text-sm">
+                        {r.initialHolding.toLocaleString()}
+                      </td>
                       <td
                         className={cn(
                           "px-4 py-2 text-right font-mono text-sm",
@@ -966,7 +1729,7 @@ export function MasterTable({
                   {summaryRows.length === 0 && (
                     <tr>
                       <td
-                        colSpan={8}
+                        colSpan={9}
                         className="p-8 text-center text-muted-foreground"
                       >
                         No summary data available for the selected
@@ -977,6 +1740,36 @@ export function MasterTable({
                 </tbody>
               </table>
             </div>
+
+            {summaryRows.length > 0 && (
+              <div className="flex items-center justify-between px-4 py-2 border-t border-border bg-card/60 text-[11px]">
+                <div className="text-muted-foreground">
+                  Showing{" "}
+                  <span className="text-foreground font-medium">
+                    {(summaryPage - 1) * summaryPageSize + 1}
+                  </span>{" "}
+                  –{" "}
+                  <span className="text-foreground font-medium">
+                    {Math.min(
+                      summaryPage * summaryPageSize,
+                      summaryRows.length
+                    )}
+                  </span>{" "}
+                  of{" "}
+                  <span className="text-foreground font-medium">
+                    {summaryRows.length}
+                  </span>{" "}
+                  matching names
+                </div>
+                <PaginationControls
+                  page={summaryPage}
+                  totalPages={summaryTotalPages}
+                  pageSize={summaryPageSize}
+                  onPageChange={setSummaryPage}
+                  onPageSizeChange={setSummaryPageSize}
+                />
+              </div>
+            )}
 
             <div className="px-4 py-2 text-[11px] text-muted-foreground bg-muted/20 border-t border-border">
               Range applied to totals using AS ON base dates:{" "}
@@ -1000,13 +1793,17 @@ export function MasterTable({
           info={matrixInfo}
           subtitle={
             <span>
-              Columns shown:{" "}
+              Sheets:{" "}
               <span className="text-foreground font-medium">
-                {orderedDates.length}
+                {fileGroups.length}
+              </span>{" "}
+              • AS ON columns:{" "}
+              <span className="text-foreground font-medium">
+                {dates.length}
               </span>{" "}
               • Order:{" "}
               <span className="text-foreground font-medium">
-                {dateOrder === "asc" ? "Old → New" : "New → Old"}
+                {dateOrder === "asc" ? "Old → New" : "New → Old (by sheet)"}
               </span>
             </span>
           }
@@ -1021,9 +1818,9 @@ export function MasterTable({
 
         {matrixOpen && (
           <>
-            {/* Color Legend (kept inside matrix section for cleanliness) */}
+            {/* Color Legend */}
             <div className="px-4 pt-4">
-              <div className="flex gap-6 mb-4 p-3 bg-card rounded-lg border border-border shadow-enterprise text-xs">
+              <div className="flex gap-6 mb-4 p-3 bg-card rounded-lg border border-border shadow-enterprise text-xs overflow-x-auto">
                 <div className="flex items-center gap-2">
                   <span className="text-muted-foreground font-medium">
                     Value Change:
@@ -1050,6 +1847,7 @@ export function MasterTable({
               <table className="w-full">
                 <thead>
                   <tr className="bg-muted/50 border-b border-border">
+                    {/* Fixed group: DPID / CLIENT / CATEGORY / NAME / INITIAL (bordered as a block) */}
                     <th className="sticky left-0 z-10 bg-muted/50 px-4 py-3 text-left">
                       <div className="flex items-center gap-2">
                         <button
@@ -1059,8 +1857,9 @@ export function MasterTable({
                           DPID
                           <SortIcon columnKey="dpid" />
                         </button>
-                        <FilterButton
+                        <MatrixFilterButton
                           columnKey="dpid"
+                          label="DPID"
                           values={uniqueValues.dpid}
                         />
                       </div>
@@ -1075,8 +1874,9 @@ export function MasterTable({
                           CLIENT-ID
                           <SortIcon columnKey="clientId" />
                         </button>
-                        <FilterButton
+                        <MatrixFilterButton
                           columnKey="clientId"
+                          label="Client ID"
                           values={uniqueValues.clientId}
                         />
                       </div>
@@ -1091,150 +1891,249 @@ export function MasterTable({
                           CATEGORY
                           <SortIcon columnKey="category" />
                         </button>
-                        <FilterButton
+                        <MatrixFilterButton
                           columnKey="category"
+                          label="Category"
                           values={uniqueValues.category}
                         />
                       </div>
                     </th>
 
                     <th className="px-4 py-3 text-left min-w-[200px]">
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => handleSort("name")}
+                          className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-muted-foreground hover:text-foreground transition-colors"
+                        >
+                          NAME
+                          <SortIcon columnKey="name" />
+                        </button>
+                        <MatrixFilterButton
+                          columnKey="name"
+                          label="Name"
+                          values={uniqueValues.name}
+                        />
+                      </div>
+                    </th>
+
+                    <th className="px-4 py-3 text-right border-r-2 border-border/80">
                       <button
-                        onClick={() => handleSort("name")}
+                        onClick={() => handleSort("initialHolding")}
                         className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-muted-foreground hover:text-foreground transition-colors"
+                        title="Initial holding (first date this name appears)"
                       >
-                        NAME
-                        <SortIcon columnKey="name" />
+                        Initial
+                        <SortIcon columnKey="initialHolding" />
                       </button>
                     </th>
 
-                    {orderedDates.map((dateKey) => (
-                      <th
-                        key={dateKey}
-                        className="px-4 py-3 text-center"
-                        colSpan={2}
-                      >
-                        <button
-                          onClick={() => handleSort(`date-${dateKey}`)}
-                          className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-muted-foreground hover:text-foreground transition-colors mx-auto"
-                        >
-                          {getBaseDate(dateKey)}
-                          <SortIcon columnKey={`date-${dateKey}`} />
-                        </button>
-                      </th>
-                    ))}
-                  </tr>
+                    {/* Now per-sheet group: [AS ON D1] | [B/S] | [AS ON D2] with a border around each trio */}
+                    {fileGroups.map((group, groupIndex) => {
+                      const firstKey = group.dateKeys[0];
+                      const secondKey = group.dateKeys[1];
 
-                  <tr className="bg-muted/30 border-b border-border">
-                    <th className="sticky left-0 z-10 bg-muted/30"></th>
-                    <th></th>
-                    <th></th>
-                    <th></th>
-                    {orderedDates.map((dateKey) => (
-                      <Fragment key={dateKey}>
-                        <th className="px-3 py-2 text-xs text-muted-foreground font-medium">
-                          Value
-                        </th>
-                        <th className="px-3 py-2 text-xs text-muted-foreground font-medium">
-                          B/S
-                        </th>
-                      </Fragment>
-                    ))}
+                      const firstBase = firstKey ? getBaseDate(firstKey) : "";
+                      const secondBase = secondKey
+                        ? getBaseDate(secondKey)
+                        : "";
+
+                      return (
+                        <Fragment
+                          key={`fg-header-${group.fileIndex}-${groupIndex}`}
+                        >
+                          <th
+                            className={cn(
+                              "px-3 py-3 text-center text-xs font-semibold uppercase tracking-wider text-muted-foreground hover:text-foreground transition-colors border-l-2 border-border/80"
+                            )}
+                          >
+                            {firstKey ? (
+                              <button
+                                onClick={() => handleSort(`date-${firstKey}`)}
+                                className="flex items-center gap-1.5 justify-center"
+                              >
+                                {firstBase}
+                                <SortIcon columnKey={`date-${firstKey}`} />
+                              </button>
+                            ) : (
+                              firstBase || "-"
+                            )}
+                          </th>
+                          <th className="px-3 py-3 text-center text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                            B/S
+                          </th>
+                          <th
+                            className={cn(
+                              "px-3 py-3 text-center text-xs font-semibold uppercase tracking-wider text-muted-foreground hover:text-foreground transition-colors border-r-2 border-border/80"
+                            )}
+                          >
+                            {secondKey ? (
+                              <button
+                                onClick={() => handleSort(`date-${secondKey}`)}
+                                className="flex items-center gap-1.5 justify-center"
+                              >
+                                {secondBase}
+                                <SortIcon columnKey={`date-${secondKey}`} />
+                              </button>
+                            ) : (
+                              secondBase || "-"
+                            )}
+                          </th>
+                        </Fragment>
+                      );
+                    })}
                   </tr>
                 </thead>
 
                 <tbody>
-                  {filteredData.map((holding, index) => (
-                    <tr
-                      key={holding.id}
-                      className={cn(
-                        "border-b border-border/50 hover:bg-muted/30 transition-colors",
-                        index % 2 === 0 ? "bg-card" : "bg-muted/10"
-                      )}
-                    >
-                      <td className="sticky left-0 z-10 px-4 py-3 font-mono text-sm bg-inherit border-r border-border/30">
-                        {holding.dpid}
-                      </td>
-                      <td className="px-4 py-3 font-mono text-sm">
-                        {holding.clientId}
-                      </td>
-                      <td className="px-4 py-3">
-                        {holding.category && (
-                          <span className="inline-flex px-2 py-0.5 text-xs font-medium rounded-md bg-accent/10 text-accent border border-accent/20">
-                            {holding.category}
-                          </span>
+                  {matrixPageRows.map((holding, index) => {
+                    const initialInfo = initialHoldingMap.get(holding.id);
+
+                    return (
+                      <tr
+                        key={holding.id}
+                        className={cn(
+                          "border-b border-border/50 hover:bg-muted/30 transition-colors",
+                          index % 2 === 0 ? "bg-card" : "bg-muted/10"
                         )}
-                      </td>
-                      <td className="px-4 py-3 font-medium text-foreground">
-                        {holding.name}
-                      </td>
+                      >
+                        <td className="sticky left-0 z-10 px-4 py-3 font-mono text-sm bg-inherit border-r border-border/30">
+                          {holding.dpid}
+                        </td>
+                        <td className="px-4 py-3 font-mono text-sm">
+                          {holding.clientId}
+                        </td>
+                        <td className="px-4 py-3">
+                          {holding.category && (
+                            <span className="inline-flex px-2 py-0.5 text-xs font-medium rounded-md bg-accent/10 text-accent border border-accent/20">
+                              {holding.category}
+                            </span>
+                          )}
+                        </td>
+                        <td className="px-4 py-3 font-medium text-foreground">
+                          {holding.name}
+                        </td>
+                        <td className="px-4 py-3 text-right font-mono text-sm border-r-2 border-border/80">
+                          {initialInfo?.value
+                            ? initialInfo.value.toLocaleString()
+                            : "-"}
+                        </td>
 
-                      {orderedDates.map((dateKey, dateIndex) => {
-                        const dv = holding.dateValues[dateKey];
+                        {/* Per-sheet blocks: [holding D1] | [B/S using D2] | [holding D2] */}
+                        {(() => {
+                          let prevValue: number | undefined = undefined;
+                          const cells: ReactNode[] = [];
 
-                        const prevKey =
-                          dateIndex > 0
-                            ? orderedDates[dateIndex - 1]
-                            : undefined;
-                        const prevValue = prevKey
-                          ? holding.dateValues[prevKey]?.value
-                          : undefined;
+                          fileGroups.forEach((group, groupIndex) => {
+                            const firstKey = group.dateKeys[0];
+                            const secondKey = group.dateKeys[1];
 
-                        const valueColorClass = dv
-                          ? getValueColorClass(dv.value, prevValue)
-                          : "";
-                        const bsColorClass = dv
-                          ? getBuySellColorClass(dv.bought, dv.sold)
-                          : "";
+                            const dv1 = firstKey
+                              ? holding.dateValues[firstKey]
+                              : undefined;
+                            const dv2 = secondKey
+                              ? holding.dateValues[secondKey]
+                              : undefined;
 
-                        return (
-                          <Fragment key={dateKey}>
-                            <td
-                              className={cn(
-                                "px-3 py-3 text-center font-mono text-sm transition-colors",
-                                valueColorClass
-                              )}
-                            >
-                              {dv?.value?.toLocaleString() || "-"}
-                            </td>
-                            <td
-                              className={cn(
-                                "px-3 py-3 text-center text-sm",
-                                bsColorClass
-                              )}
-                            >
-                              {dv ? (
-                                <div className="flex flex-col items-center gap-0.5">
-                                  {dv.bought > 0 && (
-                                    <span className="text-success font-semibold">
-                                      +{dv.bought.toLocaleString()}
-                                    </span>
-                                  )}
-                                  {dv.sold > 0 && (
-                                    <span className="text-destructive font-semibold">
-                                      -{dv.sold.toLocaleString()}
-                                    </span>
-                                  )}
-                                  {!dv.bought && !dv.sold && (
-                                    <span className="text-muted-foreground">
-                                      -
-                                    </span>
-                                  )}
-                                </div>
-                              ) : (
-                                <span className="text-muted-foreground">-</span>
-                              )}
-                            </td>
-                          </Fragment>
-                        );
-                      })}
-                    </tr>
-                  ))}
+                            // First holding (AS ON D1)
+                            const value1Color =
+                              dv1 && dv1.value !== undefined
+                                ? getValueColorClass(dv1.value, prevValue)
+                                : "";
+                            if (dv1 && dv1.value !== undefined) {
+                              prevValue = dv1.value;
+                            }
+
+                            cells.push(
+                              <td
+                                key={`v1-${holding.id}-${groupIndex}`}
+                                className={cn(
+                                  "px-3 py-3 text-center font-mono text-sm transition-colors border-l-2 border-border/80",
+                                  value1Color
+                                )}
+                              >
+                                {dv1 && dv1.value !== undefined
+                                  ? dv1.value.toLocaleString()
+                                  : "-"}
+                              </td>
+                            );
+
+                            // B/S for the sheet (using second date's bought/sold)
+                            const bsColorClass =
+                              dv2 && (dv2.bought || dv2.sold)
+                                ? getBuySellColorClass(
+                                    dv2.bought || 0,
+                                    dv2.sold || 0
+                                  )
+                                : "";
+
+                            cells.push(
+                              <td
+                                key={`bs-${holding.id}-${groupIndex}`}
+                                className={cn(
+                                  "px-3 py-3 text-center text-sm",
+                                  bsColorClass
+                                )}
+                              >
+                                {dv2 ? (
+                                  <div className="flex flex-col items-center gap-0.5">
+                                    {dv2.bought > 0 && (
+                                      <span className="text-success font-semibold">
+                                        +{dv2.bought.toLocaleString()}
+                                      </span>
+                                    )}
+                                    {dv2.sold > 0 && (
+                                      <span className="text-destructive font-semibold">
+                                        -{dv2.sold.toLocaleString()}
+                                      </span>
+                                    )}
+                                    {!dv2.bought && !dv2.sold && (
+                                      <span className="text-muted-foreground">
+                                        -
+                                      </span>
+                                    )}
+                                  </div>
+                                ) : (
+                                  <span className="text-muted-foreground">
+                                    -
+                                  </span>
+                                )}
+                              </td>
+                            );
+
+                            // Second holding (AS ON D2)
+                            const value2Color =
+                              dv2 && dv2.value !== undefined
+                                ? getValueColorClass(dv2.value, prevValue)
+                                : "";
+                            if (dv2 && dv2.value !== undefined) {
+                              prevValue = dv2.value;
+                            }
+
+                            cells.push(
+                              <td
+                                key={`v2-${holding.id}-${groupIndex}`}
+                                className={cn(
+                                  "px-3 py-3 text-center font-mono text-sm transition-colors border-r-2 border-border/80",
+                                  value2Color
+                                )}
+                              >
+                                {dv2 && dv2.value !== undefined
+                                  ? dv2.value.toLocaleString()
+                                  : "-"}
+                              </td>
+                            );
+                          });
+
+                          return cells;
+                        })()}
+                      </tr>
+                    );
+                  })}
 
                   {filteredData.length === 0 && (
                     <tr>
                       <td
-                        colSpan={4 + orderedDates.length * 2}
+                        colSpan={5 + fileGroups.length * 3}
                         className="p-12 text-center text-muted-foreground bg-muted/20"
                       >
                         <p className="font-medium">
@@ -1246,6 +2145,33 @@ export function MasterTable({
                 </tbody>
               </table>
             </div>
+
+            {filteredData.length > 0 && (
+              <div className="flex items-center justify-between px-4 py-2 border-t border-border bg-card/60 text-[11px]">
+                <div className="text-muted-foreground">
+                  Showing{" "}
+                  <span className="text-foreground font-medium">
+                    {(matrixPage - 1) * matrixPageSize + 1}
+                  </span>{" "}
+                  –{" "}
+                  <span className="text-foreground font-medium">
+                    {Math.min(matrixPage * matrixPageSize, filteredData.length)}
+                  </span>{" "}
+                  of{" "}
+                  <span className="text-foreground font-medium">
+                    {filteredData.length}
+                  </span>{" "}
+                  matching rows
+                </div>
+                <PaginationControls
+                  page={matrixPage}
+                  totalPages={matrixTotalPages}
+                  pageSize={matrixPageSize}
+                  onPageChange={setMatrixPage}
+                  onPageSizeChange={setMatrixPageSize}
+                />
+              </div>
+            )}
           </>
         )}
       </div>

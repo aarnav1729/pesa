@@ -62,11 +62,46 @@ const Index = () => {
       const { holdings: newHoldings, dates: newDates } =
         consolidateData(parsedFiles);
 
+      // 1) Persist locally (IndexedDB)
       await saveHoldings(newHoldings, newDates);
-
       setHoldings(newHoldings);
       setDates(newDates);
 
+      // 2) Fire-and-forget sync to backend
+      try {
+        const res = await fetch("/api/pesa/import", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            holdings: newHoldings,
+            dates: newDates,
+          }),
+        });
+
+        if (!res.ok) {
+          console.error("Backend sync failed with status:", res.status);
+          toast.warning(
+            `Processed ${parsedFiles.length} file(s) locally, but server sync failed (status ${res.status}).`
+          );
+        } else {
+          const data = await res.json().catch(() => null);
+          const rowsInserted = data?.rowsInserted ?? "unknown";
+          toast.success(
+            `Processed ${parsedFiles.length} file(s) with ${newHoldings.length} unique records • Synced ${rowsInserted} rows to server`
+          );
+          return; // avoid double toast below
+        }
+      } catch (syncErr) {
+        console.error("Error syncing to backend:", syncErr);
+        toast.warning(
+          `Processed ${parsedFiles.length} file(s) locally, but could not reach the server.`
+        );
+        return; // avoid double toast below
+      }
+
+      // Fallback toast if we didn’t return earlier
       toast.success(
         `Successfully processed ${parsedFiles.length} file(s) with ${newHoldings.length} unique records`
       );
@@ -83,7 +118,7 @@ const Index = () => {
       await clearAllData();
       setHoldings([]);
       setDates([]);
-      toast.success("All data cleared successfully");
+      toast.success("All local data cleared successfully");
     } catch (error) {
       console.error("Error clearing data:", error);
       toast.error("Error clearing data");
@@ -178,9 +213,9 @@ const Index = () => {
                 },
                 {
                   icon: Database,
-                  title: "Local Storage",
+                  title: "Local Storage + Sync",
                   description:
-                    "All data stored securely in your browser using IndexedDB",
+                    "Data is stored in your browser and optionally synced to the PESA database",
                 },
                 {
                   icon: Zap,
@@ -259,8 +294,8 @@ const Index = () => {
             </div>
 
             <div className="text-xs text-muted-foreground">
-              Built for fast, local, secure shareholding analysis • Data stays
-              in your browser (IndexedDB)
+              Local-first shareholding analysis • IndexedDB in-browser storage •
+              Optional sync to PESA SQL backend
             </div>
           </div>
         </div>
