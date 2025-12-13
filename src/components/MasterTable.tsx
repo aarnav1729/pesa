@@ -90,6 +90,22 @@ function getFileIndexFromDateKey(dateKey: string): number | null {
   return Number.isNaN(idx) ? null : idx;
 }
 
+
+/** Extract snapshot position from dateKey like "03-12-2025@@1-2" (returns 1 or 2 if present). */
+function getSnapshotPosFromDateKey(dateKey: string): number | null {
+  const parts = String(dateKey).split("@@");
+  if (parts.length < 2) return null;
+  const meta = parts[1]; // e.g. "1-2"
+  const posStr = meta.split("-")[1];
+  const pos = Number(posStr);
+  return Number.isNaN(pos) ? null : pos;
+}
+
+/** True if this dateKey represents the "second snapshot" column (where bought/sold deltas belong). */
+function isSecondSnapshotKey(dateKey: string): boolean {
+  return getSnapshotPosFromDateKey(dateKey) === 2;
+}
+
 function getValueColorClass(
   current: number,
   previous: number | undefined
@@ -931,26 +947,63 @@ export function MasterTable({
 
   // ---------------- Summary rows computation ----------------
   const rawSummaryRows = useMemo(() => {
-    const keysForTotals = dateKeysInSummaryRange;
+    const keysInRange = dateKeysInSummaryRange;
+
+    // In this app, bought/sold deltas belong to the "second snapshot" columns only.
+    // To guarantee: initialHolding + (bought - sold) === stillHolding,
+    // we define:
+    // - initialHolding = first holding value that exists inside the selected range
+    // - stillHolding  = last holding value that exists inside the selected range
+    // - bought/sold   = sum of deltas from second-snapshot columns AFTER the initial snapshot
 
     return filteredData.map((h) => {
-      let totalBought = 0;
-      let totalSold = 0;
-
-      for (const dateKey of keysForTotals) {
-        const dv = h.dateValues[dateKey];
-        if (dv) {
-          totalBought += dv.bought || 0;
-          totalSold += dv.sold || 0;
+      // Find the first snapshot within range where this holding exists
+      let firstIdx = -1;
+      for (let i = 0; i < keysInRange.length; i++) {
+        const dk = keysInRange[i];
+        const dv = h.dateValues[dk];
+        if (dv && dv.value !== undefined) {
+          firstIdx = i;
+          break;
         }
       }
 
+      // Find the last snapshot within range where this holding exists
+      let lastIdx = -1;
+      for (let i = keysInRange.length - 1; i >= 0; i--) {
+        const dk = keysInRange[i];
+        const dv = h.dateValues[dk];
+        if (dv && dv.value !== undefined) {
+          lastIdx = i;
+          break;
+        }
+      }
+
+      const initialHolding =
+        firstIdx >= 0 ? h.dateValues[keysInRange[firstIdx]]?.value ?? 0 : 0;
+
+      const stillHolding =
+        lastIdx >= 0 ? h.dateValues[keysInRange[lastIdx]]?.value ?? 0 : 0;
+
+      let totalBought = 0;
+      let totalSold = 0;
+
+      // Only count deltas that occur AFTER the initial snapshot.
+      // We also only count "second snapshot" date keys, because deltas are associated with that snapshot.
+      const startIdxForDeltas = Math.max(firstIdx + 1, 0);
+
+      for (let i = startIdxForDeltas; i < keysInRange.length; i++) {
+        const dateKey = keysInRange[i];
+        if (!isSecondSnapshotKey(dateKey)) continue;
+
+        const dv = h.dateValues[dateKey];
+        if (!dv) continue;
+
+        totalBought += dv.bought || 0;
+        totalSold += dv.sold || 0;
+      }
+
       const net = totalBought - totalSold;
-      const stillHolding = latestDateKey
-        ? h.dateValues[latestDateKey]?.value ?? 0
-        : 0;
-      const initialInfo = initialHoldingMap.get(h.id);
-      const initialHolding = initialInfo?.value ?? 0;
 
       return {
         id: h.id,
@@ -965,7 +1018,7 @@ export function MasterTable({
         stillHolding,
       };
     });
-  }, [filteredData, dateKeysInSummaryRange, latestDateKey, initialHoldingMap]);
+  }, [filteredData, dateKeysInSummaryRange]);
 
   // Unique values for summary header filters (from visible summary base data)
   const summaryUniqueValues = useMemo(
@@ -1250,8 +1303,7 @@ export function MasterTable({
         </li>
         <li>
           <span className="text-foreground">Still Holding</span> uses the{" "}
-          <span className="text-foreground">latest overall AS ON snapshot</span>{" "}
-          (not limited by the range).
+          <span className="text-foreground">last AS ON snapshot inside the selected range</span>.
         </li>
       </ul>
       <div className="font-medium text-foreground mt-2">
@@ -1436,9 +1488,9 @@ export function MasterTable({
           info={summaryInfo}
           subtitle={
             <span>
-              Latest snapshot:{" "}
+              Range end snapshot:{" "}
               <span className="text-foreground font-medium">
-                {latestDateKey ? getBaseDate(latestDateKey) : "-"}
+                {normalizedRange.to || (latestDateKey ? getBaseDate(latestDateKey) : "-")}
               </span>
             </span>
           }
@@ -1665,8 +1717,8 @@ export function MasterTable({
                           summaryTotals.net > 0
                             ? "text-success"
                             : summaryTotals.net < 0
-                            ? "text-destructive"
-                            : "text-muted-foreground"
+                              ? "text-destructive"
+                              : "text-muted-foreground"
                         )}
                       >
                         {summaryTotals.net.toLocaleString()}
@@ -1714,8 +1766,8 @@ export function MasterTable({
                           r.net > 0
                             ? "text-success"
                             : r.net < 0
-                            ? "text-destructive"
-                            : "text-muted-foreground"
+                              ? "text-destructive"
+                              : "text-muted-foreground"
                         )}
                       >
                         {r.net.toLocaleString()}
@@ -2061,9 +2113,9 @@ export function MasterTable({
                             const bsColorClass =
                               dv2 && (dv2.bought || dv2.sold)
                                 ? getBuySellColorClass(
-                                    dv2.bought || 0,
-                                    dv2.sold || 0
-                                  )
+                                  dv2.bought || 0,
+                                  dv2.sold || 0
+                                )
                                 : "";
 
                             cells.push(
