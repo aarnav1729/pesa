@@ -861,7 +861,7 @@ export function MasterTable({
     try {
       setIsExportingXlsx(true);
 
-      const resp = await fetch("/api/pesa/export/xlsx", {
+      const resp = await fetch("https://pesa-25wb.onrender.com/api/pesa/export/xlsx", {
         method: "GET",
       });
 
@@ -901,7 +901,7 @@ export function MasterTable({
     try {
       setIsClearing(true);
 
-      const resp = await fetch("/api/pesa/clear", {
+      const resp = await fetch("https://pesa-25wb.onrender.com/api/pesa/clear", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
