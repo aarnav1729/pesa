@@ -1008,11 +1008,247 @@ export function MasterTable({
         totalsRow,
         ...dataRows,
       ]);
+
+      if (wsSummary["!ref"]) {
+        wsSummary["!autofilter"] = { ref: wsSummary["!ref"] };
+      }
       const wsMeta = XLSX.utils.aoa_to_sheet(metaRows);
+
+      // ---------------------------
+      // ByDate sheet (long format) so Excel can filter/pivot by date easily
+      // - Exports ALL dates (so Excel can change the range later)
+      // - BaseDateExcel is a REAL Excel date (so Excel Date Filters work)
+      // - InSelection lets Excel match the current UI range instantly
+      // ---------------------------
+      // ---------------------------
+      // ByDate (ALL dates) + helper columns for dynamic Excel summary
+      // ---------------------------
+      const byDateHeaders = [
+        "BaseDate",
+        "BaseDateExcel", // real Excel date serial
+        "SnapshotPos",
+        "FileIndex",
+        "DPID",
+        "ClientID",
+        "Category",
+        "Name",
+        "Key", // h.id
+        "KeyDateRank", // BaseDateExcel*10 + SnapshotPos (numeric)
+        "KeyRank", // Key|KeyDateRank (string) for XLOOKUP
+        "Value",
+        "Bought",
+        "Sold",
+        "DateKey",
+      ];
+
+      // DD-MM-YYYY -> Excel serial (1900 system)
+      const toExcelSerial = (ddmmyyyy: string): number | "" => {
+        const dt = parseDate(ddmmyyyy);
+        if (!dt || Number.isNaN(dt.getTime())) return "";
+        const utc = Date.UTC(dt.getFullYear(), dt.getMonth(), dt.getDate());
+        const excelEpoch = Date.UTC(1899, 11, 30); // Excel day 0
+        return (utc - excelEpoch) / 86400000;
+      };
+
+      // Export ALL dateKeys (so Excel can choose any range later)
+      const exportDateKeys = Array.from(new Set(dates));
+
+      // Only include entities currently in Summary (respects summary filters)
+      const exportIdSet = new Set(summaryRows.map((r) => r.id));
+
+      const byDateRows: (string | number)[][] = [];
+      for (const h of filteredData) {
+        if (!exportIdSet.has(h.id)) continue;
+
+        for (const dk of exportDateKeys) {
+          const dv = h.dateValues?.[dk];
+          if (!dv) continue;
+
+          const base = getBaseDate(dk);
+          const serial = toExcelSerial(base);
+          const snap = getSnapshotPosFromDateKey(dk) ?? 0;
+          const fileIdx = getFileIndexFromDateKey(dk) ?? "";
+
+          const rank =
+            typeof serial === "number" ? serial * 10 + Number(snap || 0) : "";
+          const keyRank = typeof rank === "number" ? `${h.id}|${rank}` : "";
+
+          byDateRows.push([
+            base,
+            typeof serial === "number" ? serial : "",
+            snap,
+            fileIdx,
+            h.dpid,
+            h.clientId,
+            h.category || "",
+            h.name,
+            h.id,
+            typeof rank === "number" ? rank : "",
+            keyRank,
+            Number(dv.value || 0),
+            Number(dv.bought || 0),
+            Number(dv.sold || 0),
+            dk,
+          ]);
+        }
+      }
+
+      // Sort by date then snapshotpos, then ids
+      byDateRows.sort((a, b) => {
+        const aS = Number(a[1] || 0);
+        const bS = Number(b[1] || 0);
+        if (aS !== bS) return aS - bS;
+        const aP = Number(a[2] || 0);
+        const bP = Number(b[2] || 0);
+        if (aP !== bP) return aP - bP;
+        const aKey = String(a[8] || "");
+        const bKey = String(b[8] || "");
+        return aKey.localeCompare(bKey);
+      });
+
+      const wsByDate = XLSX.utils.aoa_to_sheet([byDateHeaders, ...byDateRows]);
+
+      // Format BaseDateExcel as date in Excel
+      for (let r = 1; r <= byDateRows.length; r++) {
+        const addr = XLSX.utils.encode_cell({ r, c: 1 }); // col B
+        const cell = wsByDate[addr];
+        if (cell && typeof cell.v === "number") {
+          cell.t = "n";
+          cell.z = "yyyy-mm-dd";
+        }
+      }
+
+      // Enable filters immediately
+      if (wsByDate["!ref"]) wsByDate["!autofilter"] = { ref: wsByDate["!ref"] };
+
+      // Make BaseDateExcel column truly behave like a date in Excel
+      // Column index 1 => "B"
+      for (let r = 1; r <= byDateRows.length; r++) {
+        const addr = XLSX.utils.encode_cell({ r, c: 1 });
+        const cell = wsByDate[addr];
+        if (cell && typeof cell.v === "number") {
+          cell.t = "n";
+          cell.z = "yyyy-mm-dd";
+        }
+      }
+
+      // Add AutoFilter to ByDate so Excel shows filter dropdowns immediately
+      if (wsByDate["!ref"]) {
+        wsByDate["!autofilter"] = { ref: wsByDate["!ref"] };
+      }
+
+      // ---------------------------
+      // Controls sheet (Excel user changes these)
+      // ---------------------------
+      const minBase = baseDatesSorted[0] || "";
+      const maxBase = baseDatesSorted[baseDatesSorted.length - 1] || "";
+
+      const defaultFrom = normalizedRange.from || minBase;
+      const defaultTo = normalizedRange.to || maxBase;
+
+      const fromSerial = toExcelSerial(defaultFrom);
+      const toSerial = toExcelSerial(defaultTo);
+
+      const wsControls = XLSX.utils.aoa_to_sheet([
+        ["Parameter", "Value"],
+        ["From", typeof fromSerial === "number" ? fromSerial : ""],
+        ["To", typeof toSerial === "number" ? toSerial : ""],
+        [],
+        ["Start", { f: "MIN(B2,B3)" }],
+        ["End", { f: "MAX(B2,B3)" }],
+        [],
+        ["Tip", "Change From/To above. SummaryDynamic updates automatically."],
+      ]);
+
+      // Format From/To cells as dates
+      for (const rr of [1, 2]) {
+        const addr = XLSX.utils.encode_cell({ r: rr, c: 1 }); // B2, B3
+        const cell = wsControls[addr];
+        if (cell && typeof cell.v === "number") {
+          cell.t = "n";
+          cell.z = "yyyy-mm-dd";
+        }
+      }
+      // Also format Start/End result cells (B5, B6)
+      for (const rr of [4, 5]) {
+        const addr = XLSX.utils.encode_cell({ r: rr, c: 1 });
+        const cell = wsControls[addr];
+        if (cell) {
+          cell.t = "n";
+          cell.z = "yyyy-mm-dd";
+        }
+      }
+
+      // ---------------------------
+      // SummaryDynamic (changes with Controls!From/To)
+      // ---------------------------
+      const byLast = byDateRows.length + 1; // header is row 1
+      const keyR = `ByDate!$I$2:$I$${byLast}`; // Key
+      const dateR = `ByDate!$B$2:$B$${byLast}`; // BaseDateExcel
+      const rankR = `ByDate!$J$2:$J$${byLast}`; // KeyDateRank
+      const keyRankR = `ByDate!$K$2:$K$${byLast}`; // KeyRank
+      const valR = `ByDate!$L$2:$L$${byLast}`; // Value
+      const buyR = `ByDate!$M$2:$M$${byLast}`; // Bought
+      const soldR = `ByDate!$N$2:$N$${byLast}`; // Sold
+
+      const dynHeaders = [
+        "Key",
+        "DPID",
+        "ClientID",
+        "Category",
+        "Name",
+        "Initial Holding",
+        "Bought",
+        "Sold",
+        "Net (Bought-Sold)",
+        "Still Holding",
+      ];
+
+      const dynRows = summaryRows.map((r, i) => {
+        const excelRow = i + 2; // header is row 1
+        const keyCell = `A${excelRow}`;
+
+        const startCell = "Controls!$B$5";
+        const endCell = "Controls!$B$6";
+
+        const minRank = `MINIFS(${rankR},${keyR},${keyCell},${dateR},">="&${startCell},${dateR},"<="&${endCell})`;
+        const maxRank = `MAXIFS(${rankR},${keyR},${keyCell},${dateR},">="&${startCell},${dateR},"<="&${endCell})`;
+
+        const initialVal = `IFERROR(XLOOKUP(${keyCell}&"|"&(${minRank}),${keyRankR},${valR},0),0)`;
+        const stillVal = `IFERROR(XLOOKUP(${keyCell}&"|"&(${maxRank}),${keyRankR},${valR},0),0)`;
+
+        const boughtSum = `SUMIFS(${buyR},${keyR},${keyCell},${dateR},">="&${startCell},${dateR},"<="&${endCell})`;
+        const soldSum = `SUMIFS(${soldR},${keyR},${keyCell},${dateR},">="&${startCell},${dateR},"<="&${endCell})`;
+
+        return [
+          r.id,
+          r.dpid,
+          r.clientId,
+          r.category || "",
+          r.name,
+          { f: initialVal },
+          { f: boughtSum },
+          { f: soldSum },
+          { f: `G${excelRow}-H${excelRow}` },
+          { f: stillVal },
+        ];
+      });
+
+      const wsSummaryDynamic = XLSX.utils.aoa_to_sheet([
+        dynHeaders,
+        ...dynRows,
+      ]);
+      if (wsSummaryDynamic["!ref"]) {
+        wsSummaryDynamic["!autofilter"] = { ref: wsSummaryDynamic["!ref"] };
+      }
 
       const wb = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(wb, wsSummary, "Summary");
+      XLSX.utils.book_append_sheet(wb, wsControls, "Controls");
+      XLSX.utils.book_append_sheet(wb, wsSummaryDynamic, "SummaryDynamic");
+      XLSX.utils.book_append_sheet(wb, wsByDate, "ByDate");
       XLSX.utils.book_append_sheet(wb, wsMeta, "Meta");
+
 
       const out = XLSX.write(wb, { bookType: "xlsx", type: "array" });
       const blob = new Blob([out], {

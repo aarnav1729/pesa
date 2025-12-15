@@ -35,8 +35,8 @@ const dbConfig = {
   requestTimeout: 100000,
   connectionTimeout: 10000000,
   pool: {
-    max:10,
-    min: 0, 
+    max: 10,
+    min: 0,
     idleTimeoutMillis: 300000,
   },
   options: {
