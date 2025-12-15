@@ -62,6 +62,33 @@ type FileGroup = {
 
 const PAGE_SIZE_OPTIONS = [50, 100, 200, 500, 1000];
 
+// API base:
+// - If you're serving FE from the same Express server, this works out of the box.
+// - If FE is hosted elsewhere, set VITE_API_BASE_URL (e.g. https://your-domain.com)
+const API_BASE_URL = (() => {
+  try {
+    const v = (import.meta as any)?.env?.VITE_API_BASE_URL;
+    const base =
+      typeof v === "string" && v.trim().length
+        ? v.trim().replace(/\/+$/, "")
+        : window.location.origin;
+    return `${base}/api`;
+  } catch {
+    return `${window.location.origin}/api`;
+  }
+})();
+
+function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
 /** Extract base date from a dateKey like "03-12-2025@@1-1" */
 function getBaseDate(dateKey: string): string {
   return String(dateKey).split("@@")[0] || dateKey;
@@ -89,7 +116,6 @@ function getFileIndexFromDateKey(dateKey: string): number | null {
   const idx = Number(idxStr);
   return Number.isNaN(idx) ? null : idx;
 }
-
 
 /** Extract snapshot position from dateKey like "03-12-2025@@1-2" (returns 1 or 2 if present). */
 function getSnapshotPosFromDateKey(dateKey: string): number | null {
@@ -419,7 +445,7 @@ export function MasterTable({
 
   const [isClearing, setIsClearing] = useState(false);
   const [isExportingXlsx, setIsExportingXlsx] = useState(false);
-
+  const [isExportingSummaryXlsx, setIsExportingSummaryXlsx] = useState(false);
   // Map of id -> {value, dateBase} for "Initial Holding"
   const initialHoldingMap = useMemo(() => {
     const map = new Map<string, { value: number; dateBase: string }>();
@@ -861,8 +887,9 @@ export function MasterTable({
     try {
       setIsExportingXlsx(true);
 
-      const resp = await fetch("https://pesa-25wb.onrender.com/api/pesa/export/xlsx", {
+      const resp = await fetch("/api/pesa/export/xlsx", {
         method: "GET",
+        cache: "no-store",
       });
 
       if (!resp.ok) {
@@ -888,6 +915,93 @@ export function MasterTable({
     }
   };
 
+  const exportSummaryToXLSX = async () => {
+    try {
+      setIsExportingSummaryXlsx(true);
+
+      // Lazy-load xlsx only when needed (keeps initial bundle lighter)
+      const mod: any = await import("xlsx");
+      const XLSX = mod?.default ? mod.default : mod;
+
+      // Keep the same column order as the UI table
+      const headers = [
+        "DPID",
+        "ClientID",
+        "Category",
+        "Sold",
+        "Name",
+        "Bought",
+        "Initial Holding",
+        "Net B/S (Bought - Sold)",
+        "Still Holding",
+      ];
+
+      const totalsRow: (string | number)[] = [
+        "",
+        "",
+        "",
+        summaryTotals.sold,
+        "Total",
+        summaryTotals.bought,
+        summaryTotals.initial,
+        summaryTotals.net,
+        summaryTotals.still,
+      ];
+
+      const dataRows = summaryRows.map((r) => [
+        r.dpid,
+        r.clientId,
+        r.category || "",
+        r.sold,
+        r.name,
+        r.bought,
+        r.initialHolding,
+        r.net,
+        r.stillHolding,
+      ]);
+
+      const metaRows: (string | number)[][] = [
+        ["Exported At", new Date().toISOString()],
+        ["Summary Type", summaryType],
+        ["Sort Key", summarySortKey],
+        ["Sort Direction", summarySortDir],
+        [
+          "Range",
+          normalizedRange.from && normalizedRange.to
+            ? `${normalizedRange.from} → ${normalizedRange.to}`
+            : "All dates",
+        ],
+        ["Filter: DPID", summaryFieldFilters.dpid || ""],
+        ["Filter: ClientID", summaryFieldFilters.clientId || ""],
+        ["Filter: Category", summaryFieldFilters.category || ""],
+        ["Filter: Name", summaryFieldFilters.name || ""],
+      ];
+
+      const wsSummary = XLSX.utils.aoa_to_sheet([
+        headers,
+        totalsRow,
+        ...dataRows,
+      ]);
+      const wsMeta = XLSX.utils.aoa_to_sheet(metaRows);
+
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, wsSummary, "Summary");
+      XLSX.utils.book_append_sheet(wb, wsMeta, "Meta");
+
+      const out = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+      const blob = new Blob([out], {
+        type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      });
+
+      downloadBlob(blob, "pesa-summary.xlsx");
+    } catch (err) {
+      console.error("Failed to export Summary XLSX:", err);
+      alert("Failed to export Summary XLSX. Check console for details.");
+    } finally {
+      setIsExportingSummaryXlsx(false);
+    }
+  };
+
   const toggleDateOrder = () => {
     setDateOrder((o) => (o === "asc" ? "desc" : "asc"));
   };
@@ -901,11 +1015,12 @@ export function MasterTable({
     try {
       setIsClearing(true);
 
-      const resp = await fetch("https://pesa-25wb.onrender.com/api/pesa/clear", {
+      const resp = await fetch("/api/pesa/clear", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
+        cache: "no-store",
       });
 
       if (!resp.ok) {
@@ -990,19 +1105,21 @@ export function MasterTable({
 
       // Only count deltas that occur AFTER the initial snapshot.
       // We also only count "second snapshot" date keys, because deltas are associated with that snapshot.
-      const startIdxForDeltas = Math.max(firstIdx + 1, 0);
+      if (firstIdx >= 0 && lastIdx >= 0) {
+        const startIdxForDeltas = firstIdx + 1; // AFTER initial snapshot
+        const endIdxForDeltas = lastIdx; // UP TO stillHolding snapshot
 
-      for (let i = startIdxForDeltas; i < keysInRange.length; i++) {
-        const dateKey = keysInRange[i];
-        if (!isSecondSnapshotKey(dateKey)) continue;
+        for (let i = startIdxForDeltas; i <= endIdxForDeltas; i++) {
+          const dateKey = keysInRange[i];
+          if (!isSecondSnapshotKey(dateKey)) continue;
 
-        const dv = h.dateValues[dateKey];
-        if (!dv) continue;
+          const dv = h.dateValues[dateKey];
+          if (!dv) continue;
 
-        totalBought += dv.bought || 0;
-        totalSold += dv.sold || 0;
+          totalBought += dv.bought || 0;
+          totalSold += dv.sold || 0;
+        }
       }
-
       const net = totalBought - totalSold;
 
       return {
@@ -1303,7 +1420,10 @@ export function MasterTable({
         </li>
         <li>
           <span className="text-foreground">Still Holding</span> uses the{" "}
-          <span className="text-foreground">last AS ON snapshot inside the selected range</span>.
+          <span className="text-foreground">
+            last AS ON snapshot inside the selected range
+          </span>
+          .
         </li>
       </ul>
       <div className="font-medium text-foreground mt-2">
@@ -1490,7 +1610,8 @@ export function MasterTable({
             <span>
               Range end snapshot:{" "}
               <span className="text-foreground font-medium">
-                {normalizedRange.to || (latestDateKey ? getBaseDate(latestDateKey) : "-")}
+                {normalizedRange.to ||
+                  (latestDateKey ? getBaseDate(latestDateKey) : "-")}
               </span>
             </span>
           }
@@ -1536,6 +1657,20 @@ export function MasterTable({
 
                 {/* Sort menu */}
                 <SummarySortMenu />
+
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="shadow-enterprise"
+                  onClick={exportSummaryToXLSX}
+                  disabled={isExportingSummaryXlsx || summaryRows.length === 0}
+                  title="Export the currently filtered Summary table"
+                >
+                  <Download className="w-4 h-4" />
+                  {isExportingSummaryXlsx
+                    ? "Exporting Summary..."
+                    : "Export Summary"}
+                </Button>
 
                 {/* Direction quick toggle */}
                 <Button
@@ -1717,8 +1852,8 @@ export function MasterTable({
                           summaryTotals.net > 0
                             ? "text-success"
                             : summaryTotals.net < 0
-                              ? "text-destructive"
-                              : "text-muted-foreground"
+                            ? "text-destructive"
+                            : "text-muted-foreground"
                         )}
                       >
                         {summaryTotals.net.toLocaleString()}
@@ -1766,8 +1901,8 @@ export function MasterTable({
                           r.net > 0
                             ? "text-success"
                             : r.net < 0
-                              ? "text-destructive"
-                              : "text-muted-foreground"
+                            ? "text-destructive"
+                            : "text-muted-foreground"
                         )}
                       >
                         {r.net.toLocaleString()}
@@ -2113,9 +2248,9 @@ export function MasterTable({
                             const bsColorClass =
                               dv2 && (dv2.bought || dv2.sold)
                                 ? getBuySellColorClass(
-                                  dv2.bought || 0,
-                                  dv2.sold || 0
-                                )
+                                    dv2.bought || 0,
+                                    dv2.sold || 0
+                                  )
                                 : "";
 
                             cells.push(

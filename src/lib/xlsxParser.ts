@@ -49,6 +49,31 @@ function parseDate(dateStr: string): Date {
   return new Date(0);
 }
 
+function toNumber(v: unknown): number {
+  if (v === null || v === undefined) return 0;
+  if (typeof v === "number") return Number.isFinite(v) ? v : 0;
+
+  let s = String(v).trim();
+  if (!s) return 0;
+
+  // Handle accounting negatives like "(1,234)"
+  let neg = false;
+  if (s.startsWith("(") && s.endsWith(")")) {
+    neg = true;
+    s = s.slice(1, -1).trim();
+  }
+
+  // Remove commas and spaces (supports Indian grouping too)
+  s = s.replace(/,/g, "").replace(/\s+/g, "");
+
+  // Remove leading "+"
+  if (s.startsWith("+")) s = s.slice(1);
+
+  const n = Number(s);
+  if (!Number.isFinite(n)) return 0;
+  return neg ? -n : n;
+}
+
 export async function parseXLSXFile(file: File): Promise<ParsedFile | null> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -99,10 +124,10 @@ export async function parseXLSXFile(file: File): Promise<ParsedFile | null> {
             clientId: String(row["CLIENT-ID"] || ""),
             name: String(row.NAME || ""),
             category: String(row.CATEGORY || ""),
-            firstValue: Number(row[firstAsOnCol]) || 0,
-            secondValue: Number(row[secondAsOnCol]) || 0,
-            bought: Number(row.BOUGHT) || 0,
-            sold: Number(row.SOLD) || 0,
+            firstValue: toNumber(row[firstAsOnCol]),
+            secondValue: toNumber(row[secondAsOnCol]),
+            bought: toNumber(row.BOUGHT),
+            sold: toNumber(row.SOLD),
           }))
           .filter((row) => row.name);
 
