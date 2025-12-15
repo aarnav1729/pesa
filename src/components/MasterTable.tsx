@@ -962,7 +962,7 @@ export function MasterTable({
         "Still Holding",
       ];
 
-      const totalsRow: (string | number)[] = [
+      const totalsRowSummary: (string | number)[] = [
         "",
         "",
         "",
@@ -1005,7 +1005,7 @@ export function MasterTable({
 
       const wsSummary = XLSX.utils.aoa_to_sheet([
         headers,
-        totalsRow,
+        totalsRowSummary,
         ...dataRows,
       ]);
 
@@ -1190,6 +1190,7 @@ export function MasterTable({
       const valR = `ByDate!$L$2:$L$${byLast}`; // Value
       const buyR = `ByDate!$M$2:$M$${byLast}`; // Bought
       const soldR = `ByDate!$N$2:$N$${byLast}`; // Sold
+      const posR = `ByDate!$C$2:$C$${byLast}`; // SnapshotPos (1/2)
 
       const dynHeaders = [
         "Key",
@@ -1204,21 +1205,34 @@ export function MasterTable({
         "Still Holding",
       ];
 
-      const dynRows = summaryRows.map((r, i) => {
-        const excelRow = i + 2; // header is row 1
+      // We'll add a Total row at row 2, and data starts at row 3
+      const firstDataRow = 3;
+
+      const dynDataRows = summaryRows.map((r, i) => {
+        const excelRow = i + firstDataRow; // header=1, total=2, data=3...
         const keyCell = `A${excelRow}`;
 
         const startCell = "Controls!$B$5";
         const endCell = "Controls!$B$6";
 
-        const minRank = `MINIFS(${rankR},${keyR},${keyCell},${dateR},">="&${startCell},${dateR},"<="&${endCell})`;
-        const maxRank = `MAXIFS(${rankR},${keyR},${keyCell},${dateR},">="&${startCell},${dateR},"<="&${endCell})`;
+        // Reconstruct initial properly:
+        // - If earliest in-range snapshot is pos1 => initial = value
+        // - If earliest in-range snapshot is pos2 => initial = value - (bought - sold)
+        // Also: Bought/Sold sums must include ONLY pos2 rows.
+        const initialVal = `IFERROR(LET(
+          k,${keyCell},
+          st,${startCell},
+          en,${endCell},
+          sr,MINIFS(${rankR},${keyR},k,${dateR},">="&st,${dateR},"<="&en),
+          sp,XLOOKUP(k&"|"&sr,${keyRankR},${posR},0),
+          sv,XLOOKUP(k&"|"&sr,${keyRankR},${valR},0),
+          sb,XLOOKUP(k&"|"&sr,${keyRankR},${buyR},0),
+          ss,XLOOKUP(k&"|"&sr,${keyRankR},${soldR},0),
+          IF(sp=1, sv, sv-(sb-ss))
+        ),0)`;
 
-        const initialVal = `IFERROR(XLOOKUP(${keyCell}&"|"&(${minRank}),${keyRankR},${valR},0),0)`;
-        const stillVal = `IFERROR(XLOOKUP(${keyCell}&"|"&(${maxRank}),${keyRankR},${valR},0),0)`;
-
-        const boughtSum = `SUMIFS(${buyR},${keyR},${keyCell},${dateR},">="&${startCell},${dateR},"<="&${endCell})`;
-        const soldSum = `SUMIFS(${soldR},${keyR},${keyCell},${dateR},">="&${startCell},${dateR},"<="&${endCell})`;
+        const boughtSum = `SUMIFS(${buyR},${keyR},${keyCell},${dateR},">="&${startCell},${dateR},"<="&${endCell},${posR},2)`;
+        const soldSum = `SUMIFS(${soldR},${keyR},${keyCell},${dateR},">="&${startCell},${dateR},"<="&${endCell},${posR},2)`;
 
         return [
           r.id,
@@ -1226,18 +1240,37 @@ export function MasterTable({
           r.clientId,
           r.category || "",
           r.name,
-          { f: initialVal },
-          { f: boughtSum },
-          { f: soldSum },
-          { f: `G${excelRow}-H${excelRow}` },
-          { f: stillVal },
+          { f: initialVal }, // F
+          { f: boughtSum }, // G
+          { f: soldSum }, // H
+          { f: `G${excelRow}-H${excelRow}` }, // I
+          { f: `F${excelRow}+I${excelRow}` }, // J (reconciled)
         ];
       });
 
+      const lastDataRow = dynDataRows.length
+        ? firstDataRow + dynDataRows.length - 1
+        : firstDataRow;
+
+        const totalsRowDynamic: any[] = [
+        "", // Key
+        "", // DPID
+        "", // ClientID
+        "", // Category
+        "Total",
+        { f: `SUM(F${firstDataRow}:F${lastDataRow})` }, // Initial
+        { f: `SUM(G${firstDataRow}:G${lastDataRow})` }, // Bought
+        { f: `SUM(H${firstDataRow}:H${lastDataRow})` }, // Sold
+        { f: `G2-H2` }, // Net
+        { f: `F2+I2` }, // Still (reconciled)
+      ];
+
       const wsSummaryDynamic = XLSX.utils.aoa_to_sheet([
         dynHeaders,
-        ...dynRows,
+        totalsRowDynamic,
+        ...dynDataRows,
       ]);
+
       if (wsSummaryDynamic["!ref"]) {
         wsSummaryDynamic["!autofilter"] = { ref: wsSummaryDynamic["!ref"] };
       }
@@ -1248,7 +1281,6 @@ export function MasterTable({
       XLSX.utils.book_append_sheet(wb, wsSummaryDynamic, "SummaryDynamic");
       XLSX.utils.book_append_sheet(wb, wsByDate, "ByDate");
       XLSX.utils.book_append_sheet(wb, wsMeta, "Meta");
-
 
       const out = XLSX.write(wb, { bookType: "xlsx", type: "array" });
       const blob = new Blob([out], {
