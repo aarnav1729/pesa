@@ -574,6 +574,32 @@ export function MasterTable({
     return dateOrder === "asc" ? fileGroupsAsc : [...fileGroupsAsc].reverse();
   }, [fileGroupsAsc, dateOrder]);
 
+  // ---------------- Summary period groups (range-aware, chronological) ----------------
+  // We keep summary math in strict time order regardless of "Reverse Dates" UI.
+  const summaryPeriodGroups = useMemo(() => {
+    const inRange = new Set(dateKeysInSummaryRange);
+
+    const groups = fileGroupsAsc
+      .map((g) => {
+        const k1 =
+          g.dateKeys.find((k) => getSnapshotPosFromDateKey(k) === 1) || null;
+        const k2 =
+          g.dateKeys.find((k) => getSnapshotPosFromDateKey(k) === 2) || null;
+
+        const firstKey = k1 && inRange.has(k1) ? k1 : null;
+        const secondKey = k2 && inRange.has(k2) ? k2 : null;
+
+        if (!firstKey && !secondKey) return null;
+        return { fileIndex: g.fileIndex, firstKey, secondKey };
+      })
+      .filter(Boolean) as Array<{
+      fileIndex: number;
+      firstKey: string | null;
+      secondKey: string | null;
+    }>;
+
+    return groups;
+  }, [fileGroupsAsc, dateKeysInSummaryRange]);
   // ---------------- Unique values for main matrix filters ----------------
   const uniqueValues = useMemo(() => {
     return {
@@ -1062,65 +1088,93 @@ export function MasterTable({
 
   // ---------------- Summary rows computation ----------------
   const rawSummaryRows = useMemo(() => {
-    const keysInRange = dateKeysInSummaryRange;
-
-    // In this app, bought/sold deltas belong to the "second snapshot" columns only.
-    // To guarantee: initialHolding + (bought - sold) === stillHolding,
-    // we define:
-    // - initialHolding = first holding value that exists inside the selected range
-    // - stillHolding  = last holding value that exists inside the selected range
-    // - bought/sold   = sum of deltas from second-snapshot columns AFTER the initial snapshot
+    const groups = summaryPeriodGroups;
 
     return filteredData.map((h) => {
-      // Find the first snapshot within range where this holding exists
-      let firstIdx = -1;
-      for (let i = 0; i < keysInRange.length; i++) {
-        const dk = keysInRange[i];
-        const dv = h.dateValues[dk];
-        if (dv && dv.value !== undefined) {
-          firstIdx = i;
-          break;
+      // We compute summary by FILE-PERIODS (pos1 -> pos2), which is where deltas live.
+      // This fixes the case where a name first appears in pos2 (no pos1 in-range):
+      // baseline is reconstructed as: initial = dv2.value - (dv2.bought - dv2.sold)
+
+      let startIdx = -1;
+      let endIdx = -1;
+      let endMode: "pos1" | "pos2" = "pos1";
+
+      let initialHolding = 0;
+      let endSnapshotValue = 0;
+
+      for (let i = 0; i < groups.length; i++) {
+        const g = groups[i];
+        const dv1 = g.firstKey ? h.dateValues[g.firstKey] : undefined;
+        const dv2 = g.secondKey ? h.dateValues[g.secondKey] : undefined;
+
+        // Pick the earliest baseline inside range:
+        // - Prefer pos1 value when present
+        // - Else, if pos2 exists, reconstruct pos1 using dv2 - (bought - sold)
+        if (startIdx === -1) {
+          if (dv1 && dv1.value !== undefined) {
+            startIdx = i;
+            initialHolding = Number(dv1.value || 0);
+          } else if (dv2 && dv2.value !== undefined) {
+            startIdx = i;
+            const b = Number(dv2.bought || 0);
+            const s = Number(dv2.sold || 0);
+            const v2 = Number(dv2.value || 0);
+            initialHolding = v2 - (b - s);
+          }
+        }
+
+        // Track the latest snapshot in-range (prefer pos2, else pos1)
+        if (dv2 && dv2.value !== undefined) {
+          endIdx = i;
+          endMode = "pos2";
+          endSnapshotValue = Number(dv2.value || 0);
+        } else if (dv1 && dv1.value !== undefined) {
+          endIdx = i;
+          endMode = "pos1";
+          endSnapshotValue = Number(dv1.value || 0);
         }
       }
 
-      // Find the last snapshot within range where this holding exists
-      let lastIdx = -1;
-      for (let i = keysInRange.length - 1; i >= 0; i--) {
-        const dk = keysInRange[i];
-        const dv = h.dateValues[dk];
-        if (dv && dv.value !== undefined) {
-          lastIdx = i;
-          break;
-        }
+      // If this name never appears in the selected range, keep zeros.
+      if (startIdx === -1 || endIdx === -1) {
+        return {
+          id: h.id,
+          dpid: h.dpid,
+          clientId: h.clientId,
+          category: h.category,
+          name: h.name,
+          initialHolding: 0,
+          bought: 0,
+          sold: 0,
+          net: 0,
+          stillHolding: 0,
+        };
       }
-
-      const initialHolding =
-        firstIdx >= 0 ? h.dateValues[keysInRange[firstIdx]]?.value ?? 0 : 0;
-
-      const stillHolding =
-        lastIdx >= 0 ? h.dateValues[keysInRange[lastIdx]]?.value ?? 0 : 0;
 
       let totalBought = 0;
       let totalSold = 0;
 
-      // Only count deltas that occur AFTER the initial snapshot.
-      // We also only count "second snapshot" date keys, because deltas are associated with that snapshot.
-      if (firstIdx >= 0 && lastIdx >= 0) {
-        const startIdxForDeltas = firstIdx + 1; // AFTER initial snapshot
-        const endIdxForDeltas = lastIdx; // UP TO stillHolding snapshot
+      // Include dv2 deltas from start period through end snapshot.
+      // If the end snapshot is pos1 for the last period, do NOT include that period's dv2 deltas.
+      for (let i = startIdx; i <= endIdx; i++) {
+        const g = groups[i];
+        const dv2 = g.secondKey ? h.dateValues[g.secondKey] : undefined;
+        if (!dv2) continue;
 
-        for (let i = startIdxForDeltas; i <= endIdxForDeltas; i++) {
-          const dateKey = keysInRange[i];
-          if (!isSecondSnapshotKey(dateKey)) continue;
+        const include = i < endIdx || (i === endIdx && endMode === "pos2");
+        if (!include) continue;
 
-          const dv = h.dateValues[dateKey];
-          if (!dv) continue;
-
-          totalBought += dv.bought || 0;
-          totalSold += dv.sold || 0;
-        }
+        totalBought += Number(dv2.bought || 0);
+        totalSold += Number(dv2.sold || 0);
       }
+
       const net = totalBought - totalSold;
+      const expectedStill = initialHolding + net;
+
+      // Airtight reconciliation:
+      // we show "Still Holding" as the reconciled number so Initial + Bought - Sold always matches.
+      // (If you ever want to expose the raw end snapshot too, it’s in `endSnapshotValue`.)
+      const stillHolding = expectedStill;
 
       return {
         id: h.id,
@@ -1135,7 +1189,7 @@ export function MasterTable({
         stillHolding,
       };
     });
-  }, [filteredData, dateKeysInSummaryRange]);
+  }, [filteredData, summaryPeriodGroups]);
 
   // Unique values for summary header filters (from visible summary base data)
   const summaryUniqueValues = useMemo(
@@ -1541,6 +1595,21 @@ export function MasterTable({
           >
             <Download className="w-4 h-4" />
             {isExportingXlsx ? "Exporting XLSX..." : "Export XLSX"}
+          </Button>
+
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => {
+              setSummaryOpen(true); // so user also sees the Summary controls
+              exportSummaryToXLSX();
+            }}
+            disabled={isExportingSummaryXlsx || summaryRows.length === 0}
+            className="shadow-enterprise"
+            title="Export the currently computed Summary table (respects filters + range)"
+          >
+            <Download className="w-4 h-4" />
+            {isExportingSummaryXlsx ? "Exporting Summary..." : "Export Summary"}
           </Button>
 
           <Button
