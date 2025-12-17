@@ -13,6 +13,7 @@ const compression = require("compression");
 const morgan = require("morgan");
 const sql = require("mssql");
 const XLSX = require("xlsx");
+const ExcelJS = require("exceljs");
 
 // HTTPS options (paths as requested)
 const httpsOptions = {
@@ -175,6 +176,35 @@ function getFileIndexFromDateKeyServer(dateKey) {
   const idxStr = meta.split("-")[0];
   const idx = Number(idxStr);
   return Number.isNaN(idx) ? null : idx;
+}
+
+// Extract snapshot position from dateKey like "03-12-2025@@1-2" (returns 1 or 2)
+function getSnapshotPosFromDateKeyServer(dateKey) {
+  const parts = String(dateKey || "").split("@@");
+  if (parts.length < 2) return null;
+  const meta = parts[1]; // e.g. "1-2"
+  const posStr = meta.split("-")[1];
+  const pos = Number(posStr);
+  return Number.isNaN(pos) ? null : pos;
+}
+
+// DD-MM-YYYY -> Excel serial (1900 system)
+function toExcelSerialFromDDMMYYYY(ddmmyyyy) {
+  const dt = parseDateStringToJsDate(ddmmyyyy);
+  if (!dt || Number.isNaN(dt.getTime())) return null;
+  const utc = Date.UTC(dt.getFullYear(), dt.getMonth(), dt.getDate());
+  const excelEpoch = Date.UTC(1899, 11, 30); // Excel day 0
+  return (utc - excelEpoch) / 86400000;
+}
+
+// Format DD-MM-YYYY -> dropdown label like "12 Nov" (adds year only if multiple years exist)
+function formatDropdownLabelFromBase(baseStr, includeYear) {
+  const dt = parseDateStringToJsDate(baseStr);
+  if (!dt || Number.isNaN(dt.getTime())) return String(baseStr || "");
+  const day = String(dt.getDate()).padStart(2, "0");
+  const mon = dt.toLocaleString("en-US", { month: "short" }); // Nov, Dec, etc.
+  const y = dt.getFullYear();
+  return includeYear ? `${day} ${mon} ${y}` : `${day} ${mon}`;
 }
 
 // Build the same matrix headers + rows as FE, but from DB recordset
@@ -550,6 +580,628 @@ app.get("/api/pesa/export/xlsx", async (req, res) => {
     res
       .status(500)
       .json({ ok: false, error: "Failed to generate XLSX export" });
+  }
+});
+
+/**
+ * GET /api/pesa/rn
+ * Generates the FULL Summary workbook from DB:
+ * - Summary
+ * - Controls
+ * - SummaryDynamic (Excel formulas driven by Controls)
+ * - ByDate (long format; one row per dbo.pesa_data row)
+ * - Meta
+ *
+ * Designed for very large datasets (streaming XLSX writer).
+ */
+app.get("/api/pesa/rn", async (req, res) => {
+  let workbook = null;
+
+  try {
+    const pool = await getPool();
+
+    // Download headers
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const filename = `pesa-summary-${stamp}.xlsx`;
+
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    res.setHeader("Cache-Control", "no-store");
+
+    // Streaming workbook -> response stream
+    workbook = new ExcelJS.stream.xlsx.WorkbookWriter({
+      stream: res,
+      useStyles: true,
+      useSharedStrings: true,
+    });
+
+    // -------------------- Create sheets in the same order as FE export --------------------
+    const wsSummary = workbook.addWorksheet("Summary");
+    const wsControls = workbook.addWorksheet("Controls");
+    const wsSummaryDynamic = workbook.addWorksheet("SummaryDynamic");
+    const wsByDate = workbook.addWorksheet("ByDate");
+    const wsMeta = workbook.addWorksheet("Meta");
+
+    const wsLists = workbook.addWorksheet("Lists");
+    // Hide helper sheet (keeps workbook clean)
+    wsLists.state = "veryHidden";
+
+    // -------------------- ByDate headers (matches FE exportSummaryToXLSX) --------------------
+    const byDateHeaders = [
+      "BaseDate",
+      "BaseDateExcel", // real Excel date serial
+      "SnapshotPos",
+      "FileIndex",
+      "DPID",
+      "ClientID",
+      "Category",
+      "Name",
+      "Key", // h.id
+      "KeyDateRank", // BaseDateExcel*10 + SnapshotPos
+      "KeyRank", // Key|KeyDateRank
+      "Value",
+      "Bought",
+      "Sold",
+      "DateKey",
+    ];
+
+    wsByDate.addRow(byDateHeaders).commit();
+    wsByDate.autoFilter = {
+      from: { row: 1, column: 1 },
+      to: { row: 1, column: byDateHeaders.length },
+    };
+
+    // Helpful column widths (optional)
+    wsByDate.columns = [
+      { width: 12 }, // BaseDate
+      { width: 14 }, // BaseDateExcel
+      { width: 12 }, // SnapshotPos
+      { width: 10 }, // FileIndex
+      { width: 16 }, // DPID
+      { width: 16 }, // ClientID
+      { width: 14 }, // Category
+      { width: 30 }, // Name
+      { width: 32 }, // Key
+      { width: 14 }, // KeyDateRank
+      { width: 40 }, // KeyRank
+      { width: 14 }, // Value
+      { width: 12 }, // Bought
+      { width: 12 }, // Sold
+      { width: 22 }, // DateKey
+    ];
+
+    // -------------------- Aggregation state for Summary/Controls --------------------
+    const aggMap = new Map();
+    // Collect unique AS ON base dates (Excel serial -> baseStr)
+    const serialToBaseStr = new Map(); // intSerial -> "DD-MM-YYYY"
+
+    let totalDbRows = 0;
+
+    let globalMinSerial = Infinity;
+    let globalMaxSerial = -Infinity;
+
+    // Stream query (don’t load 3L rows into memory)
+    const request = pool.request();
+    request.stream = true;
+
+    const query = `
+      SELECT dpid, clientId, name, category, dateKey, baseDate, value, bought, sold
+      FROM dbo.pesa_data
+      ORDER BY baseDate, dateKey, dpid, clientId, name
+    `;
+
+    // IMPORTANT: attach listeners BEFORE query() in streaming mode
+    request.on("row", (row) => {
+      totalDbRows++;
+
+      const dpid = String(row.dpid || "");
+      const clientId = String(row.clientId || "");
+      const nameNorm = normalizeName(String(row.name || ""));
+      const category = row.category ? String(row.category) : "";
+
+      const dateKey = String(row.dateKey || "");
+      const baseStr = getBaseDate(dateKey); // DD-MM-YYYY
+      const serial = toExcelSerialFromDDMMYYYY(baseStr);
+      // Track unique base dates for dropdown (keep as integer serial)
+      if (typeof serial === "number" && Number.isFinite(serial)) {
+        const intSerial = Math.round(serial);
+        if (!serialToBaseStr.has(intSerial)) {
+          serialToBaseStr.set(intSerial, baseStr);
+        }
+      }
+
+      const snapshotPos = getSnapshotPosFromDateKeyServer(dateKey) ?? 0;
+      const fileIndex = getFileIndexFromDateKeyServer(dateKey) ?? "";
+
+      const value = Number(row.value || 0);
+      const bought = Number(row.bought || 0);
+      const sold = Number(row.sold || 0);
+
+      const key = `${dpid}|${clientId}|${nameNorm}`;
+
+      const rank =
+        typeof serial === "number"
+          ? serial * 10 + Number(snapshotPos || 0)
+          : null;
+      const keyRank = typeof rank === "number" ? `${key}|${rank}` : "";
+
+      // Track global min/max for Controls
+      if (typeof serial === "number") {
+        if (serial < globalMinSerial) globalMinSerial = serial;
+        if (serial > globalMaxSerial) globalMaxSerial = serial;
+      }
+
+      // Update per-key aggregation for Summary
+      let agg = aggMap.get(key);
+      if (!agg) {
+        agg = {
+          id: key,
+          dpid,
+          clientId,
+          category: category || "",
+          name: nameNorm,
+          minRank: Infinity,
+          minPos: 0,
+          minValue: 0,
+          minBought: 0,
+          minSold: 0,
+          maxRank: -Infinity,
+          boughtSum: 0,
+          soldSum: 0,
+        };
+        aggMap.set(key, agg);
+      } else {
+        // Prefer non-empty category
+        if (!agg.category && category) agg.category = category;
+      }
+
+      if (typeof rank === "number") {
+        if (rank < agg.minRank) {
+          agg.minRank = rank;
+          agg.minPos = snapshotPos;
+          agg.minValue = value;
+          agg.minBought = bought;
+          agg.minSold = sold;
+        }
+        if (rank > agg.maxRank) {
+          agg.maxRank = rank;
+        }
+      }
+
+      if (snapshotPos === 2) {
+        agg.boughtSum += bought;
+        agg.soldSum += sold;
+      }
+
+      // Write ByDate row
+      const outRow = wsByDate.addRow([
+        baseStr,
+        typeof serial === "number" ? serial : "",
+        snapshotPos,
+        fileIndex,
+        dpid,
+        clientId,
+        category,
+        nameNorm,
+        key,
+        typeof rank === "number" ? rank : "",
+        keyRank,
+        value,
+        bought,
+        sold,
+        dateKey,
+      ]);
+
+      // Format BaseDateExcel as date
+      const c2 = outRow.getCell(2);
+      if (typeof c2.value === "number") c2.numFmt = "yyyy-mm-dd";
+
+      outRow.commit();
+    });
+
+    request.on("error", (err) => {
+      console.error("[API] /api/pesa/rn stream error", err);
+      // If the stream errors mid-flight, Excel file will be incomplete.
+      // Close the workbook to end response.
+      try {
+        wsByDate.commit();
+        wsSummary.commit();
+        wsControls.commit();
+        wsSummaryDynamic.commit();
+        wsMeta.commit();
+      } catch {}
+      try {
+        workbook.commit();
+      } catch {}
+    });
+
+    request.on("done", async () => {
+      try {
+        // -------------------- Build Summary rows --------------------
+        const summaryHeaders = [
+          "DPID",
+          "ClientID",
+          "Category",
+          "Sold",
+          "Name",
+          "Bought",
+          "Initial Holding",
+          "Net B/S (Bought - Sold)",
+          "Still Holding",
+        ];
+
+        wsSummary.columns = [
+          { width: 16 },
+          { width: 16 },
+          { width: 14 },
+          { width: 12 },
+          { width: 30 },
+          { width: 12 },
+          { width: 16 },
+          { width: 18 },
+          { width: 16 },
+        ];
+
+        wsSummary.addRow(summaryHeaders).commit();
+        wsSummary.autoFilter = {
+          from: { row: 1, column: 1 },
+          to: { row: 1, column: summaryHeaders.length },
+        };
+
+        // Compute per-key summary
+        const rows = Array.from(aggMap.values()).map((a) => {
+          // initial reconstruction matches FE logic:
+          // if earliest snapshot is pos1 => initial=value
+          // if earliest snapshot is pos2 => initial = value - (bought - sold)
+          const initial =
+            a.minPos === 1
+              ? Number(a.minValue || 0)
+              : Number(a.minValue || 0) -
+                (Number(a.minBought || 0) - Number(a.minSold || 0));
+
+          const boughtSum = Number(a.boughtSum || 0);
+          const soldSum = Number(a.soldSum || 0);
+          const net = boughtSum - soldSum;
+          const still = initial + net;
+
+          return {
+            id: a.id,
+            dpid: a.dpid,
+            clientId: a.clientId,
+            category: a.category || "",
+            name: a.name,
+            initial,
+            bought: boughtSum,
+            sold: soldSum,
+            net,
+            still,
+          };
+        });
+
+        // Sort same default feel as UI (net desc)
+        rows.sort((x, y) => (y.net || 0) - (x.net || 0));
+
+        // Totals
+        let tInitial = 0,
+          tBought = 0,
+          tSold = 0,
+          tNet = 0,
+          tStill = 0;
+
+        for (const r of rows) {
+          tInitial += r.initial;
+          tBought += r.bought;
+          tSold += r.sold;
+          tNet += r.net;
+          tStill += r.still;
+        }
+
+        // Totals row (row 2)
+        wsSummary
+          .addRow(["", "", "", tSold, "Total", tBought, tInitial, tNet, tStill])
+          .commit();
+
+        // Data rows
+        for (const r of rows) {
+          wsSummary
+            .addRow([
+              r.dpid,
+              r.clientId,
+              r.category,
+              r.sold,
+              r.name,
+              r.bought,
+              r.initial,
+              r.net,
+              r.still,
+            ])
+            .commit();
+        }
+
+        // -------------------- Controls sheet --------------------
+        // Build sorted unique list of AS ON dates for dropdowns
+        const serials = Array.from(serialToBaseStr.keys()).sort(
+          (a, b) => a - b
+        );
+
+        // Determine if multiple years exist; if yes, include year in labels to avoid ambiguity
+        const yearSet = new Set();
+        for (const s of serials) {
+          const baseStr = serialToBaseStr.get(s);
+          const dt = parseDateStringToJsDate(baseStr);
+          if (dt && !Number.isNaN(dt.getTime())) yearSet.add(dt.getFullYear());
+        }
+        const includeYearInLabel = yearSet.size > 1;
+
+        // Populate Lists sheet (Label -> Serial)
+        wsLists.columns = [{ width: 18 }, { width: 14 }];
+        wsLists.addRow(["Label", "Serial"]).commit();
+
+        for (const s of serials) {
+          const baseStr = serialToBaseStr.get(s) || "";
+          const label = formatDropdownLabelFromBase(
+            baseStr,
+            includeYearInLabel
+          );
+
+          const rr = wsLists.addRow([label, s]);
+          // Serial column is an Excel date serial; format nicely (even though sheet is hidden)
+          rr.getCell(2).numFmt = "yyyy-mm-dd";
+          rr.commit();
+        }
+
+        // Default From/To = global min/max (as Excel date serial)
+        const minSerial = Number.isFinite(globalMinSerial)
+          ? Math.round(globalMinSerial)
+          : "";
+        const maxSerial = Number.isFinite(globalMaxSerial)
+          ? Math.round(globalMaxSerial)
+          : "";
+
+        // Compute default labels from min/max (fallback to first/last in list)
+        const effectiveMinSerial =
+          typeof minSerial === "number" && serialToBaseStr.has(minSerial)
+            ? minSerial
+            : serials[0] ?? "";
+        const effectiveMaxSerial =
+          typeof maxSerial === "number" && serialToBaseStr.has(maxSerial)
+            ? maxSerial
+            : serials[serials.length - 1] ?? "";
+
+        const defaultFromBase = serialToBaseStr.get(effectiveMinSerial) || "";
+        const defaultToBase = serialToBaseStr.get(effectiveMaxSerial) || "";
+
+        const defaultFromLabel = formatDropdownLabelFromBase(
+          defaultFromBase,
+          includeYearInLabel
+        );
+        const defaultToLabel = formatDropdownLabelFromBase(
+          defaultToBase,
+          includeYearInLabel
+        );
+
+        wsControls.columns = [{ width: 18 }, { width: 26 }];
+
+        wsControls.addRow(["Parameter", "Value"]).commit();
+
+        const listLastRow = serials.length + 1; // header row is 1
+        const labelRange = `Lists!$A$2:$A$${listLastRow}`;
+        const serialRange = `Lists!$B$2:$B$${listLastRow}`;
+
+        // From/To as LABELS (dropdown) — MUST set validation BEFORE row.commit() in streaming mode
+        const rFrom = wsControls.addRow(["From", defaultFromLabel]);
+        rFrom.getCell(2).dataValidation = {
+          type: "list",
+          allowBlank: false,
+          showInputMessage: true,
+          promptTitle: "Select AS ON date",
+          prompt:
+            "Pick a value from the dropdown (pulled from all uploaded sheets).",
+          showErrorMessage: true,
+          errorTitle: "Invalid selection",
+          error: "Please select a value from the dropdown list.",
+          // ExcelJS expects range formula WITHOUT leading "="
+          formulae: [labelRange],
+        };
+        rFrom.commit();
+
+        const rTo = wsControls.addRow(["To", defaultToLabel]);
+        rTo.getCell(2).dataValidation = {
+          type: "list",
+          allowBlank: false,
+          showInputMessage: true,
+          promptTitle: "Select AS ON date",
+          prompt:
+            "Pick a value from the dropdown (pulled from all uploaded sheets).",
+          showErrorMessage: true,
+          errorTitle: "Invalid selection",
+          error: "Please select a value from the dropdown list.",
+          formulae: [labelRange],
+        };
+        rTo.commit();
+
+        wsControls.addRow([]).commit();
+
+        // Start/End remain NUMERIC serials (used by SummaryDynamic formulas)
+        const fromSerialLookup = `XLOOKUP(B2,${labelRange},${serialRange},"")`;
+        const toSerialLookup = `XLOOKUP(B3,${labelRange},${serialRange},"")`;
+
+        const rStart = wsControls.addRow([
+          "Start",
+          { formula: `MIN(${fromSerialLookup},${toSerialLookup})` },
+        ]);
+        rStart.getCell(2).numFmt = "yyyy-mm-dd";
+        rStart.commit();
+
+        const rEnd = wsControls.addRow([
+          "End",
+          { formula: `MAX(${fromSerialLookup},${toSerialLookup})` },
+        ]);
+        rEnd.getCell(2).numFmt = "yyyy-mm-dd";
+        rEnd.commit();
+
+        wsControls.addRow([]).commit();
+        wsControls
+          .addRow([
+            "Tip",
+            "Use the From/To dropdowns above. SummaryDynamic updates automatically.",
+          ])
+          .commit();
+
+        // -------------------- SummaryDynamic sheet (formulas) --------------------
+        // Use full-column ranges so we don't need last-row counts.
+        const keyR = `ByDate!$I:$I`; // Key
+        const dateR = `ByDate!$B:$B`; // BaseDateExcel
+        const rankR = `ByDate!$J:$J`; // KeyDateRank
+        const keyRankR = `ByDate!$K:$K`; // KeyRank
+        const valR = `ByDate!$L:$L`; // Value
+        const buyR = `ByDate!$M:$M`; // Bought
+        const soldR = `ByDate!$N:$N`; // Sold
+        const posR = `ByDate!$C:$C`; // SnapshotPos
+
+        const dynHeaders = [
+          "Key",
+          "DPID",
+          "ClientID",
+          "Category",
+          "Name",
+          "Initial Holding",
+          "Bought",
+          "Sold",
+          "Net (Bought-Sold)",
+          "Still Holding",
+        ];
+
+        wsSummaryDynamic.columns = [
+          { width: 32 },
+          { width: 16 },
+          { width: 16 },
+          { width: 14 },
+          { width: 30 },
+          { width: 16 },
+          { width: 12 },
+          { width: 12 },
+          { width: 14 },
+          { width: 16 },
+        ];
+
+        wsSummaryDynamic.addRow(dynHeaders).commit();
+
+        // Totals row at row 2; data starts at row 3
+        const totalRow = wsSummaryDynamic.addRow([
+          "",
+          "",
+          "",
+          "",
+          "Total",
+          { formula: `SUM(F3:F1048576)` },
+          { formula: `SUM(G3:G1048576)` },
+          { formula: `SUM(H3:H1048576)` },
+          { formula: `G2-H2` },
+          { formula: `F2+I2` },
+        ]);
+        totalRow.commit();
+
+        const startCell = "Controls!$B$5";
+        const endCell = "Controls!$B$6";
+
+        let excelRow = 3;
+        for (const r of rows) {
+          const keyCell = `A${excelRow}`;
+
+          // FE-equivalent initial formula (LET + MINIFS + XLOOKUP)
+          const initialFormula =
+            `IFERROR(LET(` +
+            `k,${keyCell},` +
+            `st,${startCell},` +
+            `en,${endCell},` +
+            `sr,MINIFS(${rankR},${keyR},k,${dateR},">="&st,${dateR},"<="&en),` +
+            `sp,XLOOKUP(k&"|"&sr,${keyRankR},${posR},0),` +
+            `sv,XLOOKUP(k&"|"&sr,${keyRankR},${valR},0),` +
+            `sb,XLOOKUP(k&"|"&sr,${keyRankR},${buyR},0),` +
+            `ss,XLOOKUP(k&"|"&sr,${keyRankR},${soldR},0),` +
+            `IF(sp=1,sv,sv-(sb-ss))` +
+            `),0)`;
+
+          const boughtSumFormula = `SUMIFS(${buyR},${keyR},${keyCell},${dateR},">="&${startCell},${dateR},"<="&${endCell},${posR},2)`;
+
+          const soldSumFormula = `SUMIFS(${soldR},${keyR},${keyCell},${dateR},">="&${startCell},${dateR},"<="&${endCell},${posR},2)`;
+
+          const rowOut = wsSummaryDynamic.addRow([
+            r.id,
+            r.dpid,
+            r.clientId,
+            r.category || "",
+            r.name,
+            { formula: initialFormula },
+            { formula: boughtSumFormula },
+            { formula: soldSumFormula },
+            { formula: `G${excelRow}-H${excelRow}` },
+            { formula: `F${excelRow}+I${excelRow}` },
+          ]);
+          rowOut.commit();
+          excelRow++;
+        }
+
+        wsSummaryDynamic.autoFilter = {
+          from: { row: 1, column: 1 },
+          to: { row: 1, column: dynHeaders.length },
+        };
+
+        // -------------------- Meta sheet --------------------
+        wsMeta.columns = [{ width: 24 }, { width: 60 }];
+        wsMeta.addRow(["ExportedAt", new Date().toISOString()]).commit();
+        wsMeta.addRow(["DB Rows (dbo.pesa_data)", totalDbRows]).commit();
+        wsMeta.addRow(["Unique Keys", rows.length]).commit();
+        wsMeta.addRow(["Default Range From (serial)", minSerial]).commit();
+        wsMeta.addRow(["Default Range To (serial)", maxSerial]).commit();
+        wsMeta
+          .addRow([
+            "Endpoint",
+            "/api/pesa/rn (generates Summary + Controls + SummaryDynamic + ByDate + Meta)",
+          ])
+          .commit();
+
+        // -------------------- Commit sheets + workbook --------------------
+        wsByDate.commit();
+        wsSummary.commit();
+        wsControls.commit();
+        wsSummaryDynamic.commit();
+        wsMeta.commit();
+        wsLists.commit();
+
+        await workbook.commit();
+      } catch (err) {
+        console.error("[API] /api/pesa/rn finalize error", err);
+        try {
+          wsByDate.commit();
+          wsSummary.commit();
+          wsControls.commit();
+          wsSummaryDynamic.commit();
+          wsMeta.commit();
+        } catch {}
+        try {
+          await workbook.commit();
+        } catch {}
+      }
+    });
+    // Start streaming AFTER listeners are attached
+    request.query(query);
+  } catch (err) {
+    console.error("[API] /api/pesa/rn error", err);
+    // If we haven't started streaming XLSX properly, return JSON.
+    // If headers were already sent, just end.
+    if (!res.headersSent) {
+      return res
+        .status(500)
+        .json({ ok: false, error: "Failed to generate RN summary XLSX" });
+    }
+    try {
+      res.end();
+    } catch {}
   }
 });
 

@@ -74,6 +74,45 @@ function toNumber(v: unknown): number {
   return neg ? -n : n;
 }
 
+/** Preprocess: pick Buyers_Sellers sheet, delete first 2 rows + last totals row */
+function getCleanedBuyersSellersSheet(
+  workbook: XLSX.WorkBook
+): XLSX.WorkSheet | null {
+  const targetName =
+    workbook.SheetNames.find((n) =>
+      String(n).toLowerCase().includes("buyers_sellers")
+    ) || null;
+
+  if (!targetName) return null;
+
+  const original = workbook.Sheets[targetName];
+  if (!original) return null;
+
+  // Read full sheet as array-of-arrays so we can drop rows safely
+  let aoa = XLSX.utils.sheet_to_json<any[]>(original, {
+    header: 1,
+    defval: "",
+    blankrows: false,
+  });
+
+  // Delete first two rows
+  aoa = aoa.slice(2);
+
+  // Trim trailing fully-empty rows (common in exports)
+  const isRowEmpty = (row: any[]) =>
+    !row || row.length === 0 || row.every((c) => String(c ?? "").trim() === "");
+  while (aoa.length > 0 && isRowEmpty(aoa[aoa.length - 1])) aoa.pop();
+
+  // Delete last row (totals)
+  if (aoa.length > 0) aoa.pop();
+
+  // If nothing left, return null
+  if (aoa.length === 0) return null;
+
+  // Convert back to worksheet so existing logic can run unchanged
+  return XLSX.utils.aoa_to_sheet(aoa);
+}
+
 export async function parseXLSXFile(file: File): Promise<ParsedFile | null> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -82,10 +121,19 @@ export async function parseXLSXFile(file: File): Promise<ParsedFile | null> {
       try {
         const data = new Uint8Array(e.target?.result as ArrayBuffer);
         const workbook = XLSX.read(data, { type: "array" });
-        const sheetName = workbook.SheetNames[0];
-        const worksheet = workbook.Sheets[sheetName];
 
-        const jsonData: RawRow[] = XLSX.utils.sheet_to_json(worksheet);
+        // ✅ NEW: Only consider sheet whose name contains "Buyers_Sellers"
+        const cleanedWorksheet = getCleanedBuyersSellersSheet(workbook);
+        if (!cleanedWorksheet) {
+          console.warn(
+            `Could not find a sheet containing "Buyers_Sellers" or sheet became empty after trimming rows`
+          );
+          resolve(null);
+          return;
+        }
+
+        // Proceed with the current process on the cleaned sheet
+        const jsonData: RawRow[] = XLSX.utils.sheet_to_json(cleanedWorksheet);
 
         if (jsonData.length === 0) {
           resolve(null);
