@@ -11,7 +11,9 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@azure/identity": "^4.13.0",
     "@hookform/resolvers": "^3.10.0",
+    "@microsoft/microsoft-graph-client": "^3.0.7",
     "@radix-ui/react-accordion": "^1.2.11",
     "@radix-ui/react-alert-dialog": "^1.1.14",
     "@radix-ui/react-aspect-ratio": "^1.1.7",
@@ -44,6 +46,7 @@
     "clsx": "^2.1.1",
     "cmdk": "^1.1.1",
     "compression": "^1.8.1",
+    "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
     "date-fns": "^3.6.0",
     "dotenv": "^17.2.3",
@@ -53,6 +56,8 @@
     "helmet": "^8.1.0",
     "idb": "^8.0.3",
     "input-otp": "^1.4.2",
+    "isomorphic-fetch": "^3.0.0",
+    "jsonwebtoken": "^9.0.3",
     "lucide-react": "^0.462.0",
     "morgan": "^1.10.1",
     "mssql": "^12.2.0",

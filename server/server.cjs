@@ -7,6 +7,13 @@ const path = require("path");
 const https = require("https");
 
 const express = require("express");
+const cookieParser = require("cookie-parser");
+const jwt = require("jsonwebtoken");
+
+// Microsoft Graph (OTP Email)
+const { Client } = require("@microsoft/microsoft-graph-client");
+const { ClientSecretCredential } = require("@azure/identity");
+require("isomorphic-fetch");
 const cors = require("cors");
 const helmet = require("helmet");
 const compression = require("compression");
@@ -25,6 +32,120 @@ const httpsOptions = {
 const APP_PORT = Number(process.env.PORT || 27443);
 const APP_HOST = process.env.HOST || "0.0.0.0";
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Auth + OTP + Graph config
+// ─────────────────────────────────────────────────────────────────────────────
+function mustGetEnv(name) {
+  const v = process.env[name];
+  if (!v || !String(v).trim()) {
+    console.error(`❌ Missing required env: ${name}`);
+    process.exit(1);
+  }
+  return String(v).trim();
+}
+
+// IMPORTANT: Do NOT hardcode secrets. Put the same values you used in INVEST into .env for PESA.
+const GRAPH_CLIENT_ID = "3d310826-2173-44e5-b9a2-b21e940b67f7";
+const GRAPH_TENANT_ID = "1c3de7f3-f8d1-41d3-8583-2517cf3ba3b1";
+const GRAPH_CLIENT_SECRET = "2e78Q~yX92LfwTTOg4EYBjNQrXrZ2z5di1Kvebog";
+const GRAPH_SENDER_EMAIL = "spot@premierenergies.com"; // e.g. spot@premierenergies.com
+
+const SESSION_JWT_SECRET = mustGetEnv("PESA_JWT_SECRET"); // any strong random string
+const COOKIE_DOMAIN = (process.env.COOKIE_DOMAIN || "").trim(); // optional (blank for localhost)
+const SESSION_COOKIE = "pesa_session";
+
+// Allow-list (server is the source of truth)
+// Set: PESA_ALLOWED_EMAILS="a@premierenergies.com,b@premierenergies.com"
+const ALLOWED = new Set(
+  String(process.env.PESA_ALLOWED_EMAILS || "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean)
+);
+// Safe fallback (keep aligned with your Login.tsx)
+if (ALLOWED.size === 0) {
+  ["vcs@premierenergies.com", "saluja@premierenergies.com"].forEach((e) =>
+    ALLOWED.add(e)
+  );
+}
+
+function normalizeEmail(userInput = "") {
+  const raw = String(userInput || "")
+    .trim()
+    .toLowerCase();
+  if (!raw) return "";
+  return raw.includes("@") ? raw : `${raw}@premierenergies.com`;
+}
+function isAllowed(email) {
+  return ALLOWED.has(
+    String(email || "")
+      .trim()
+      .toLowerCase()
+  );
+}
+
+// Graph client (once)
+const credential = new ClientSecretCredential(
+  GRAPH_TENANT_ID,
+  GRAPH_CLIENT_ID,
+  GRAPH_CLIENT_SECRET
+);
+const graphClient = Client.initWithMiddleware({
+  authProvider: {
+    getAccessToken: () =>
+      credential
+        .getToken("https://graph.microsoft.com/.default")
+        .then((t) => t.token),
+  },
+});
+
+async function sendEmail(to, subject, html) {
+  await graphClient.api(`/users/${GRAPH_SENDER_EMAIL}/sendMail`).post({
+    message: {
+      subject,
+      body: { contentType: "HTML", content: html },
+      toRecipients: [{ emailAddress: { address: to } }],
+    },
+    saveToSentItems: "true",
+  });
+}
+
+function cookieBaseOptions(req) {
+  // You’re running HTTPS already; secure cookies are correct.
+  // If you ever terminate TLS elsewhere, keep `app.set("trust proxy", 1)` (we do below).
+  const base = {
+    httpOnly: true,
+    secure: true,
+    sameSite: "lax",
+  };
+
+  // Optional cookie domain support (e.g. ".premierenergies.com")
+  const host = (req.hostname || "").toLowerCase();
+  const normalizedDomain = (COOKIE_DOMAIN || "")
+    .replace(/^\./, "")
+    .toLowerCase();
+  const shouldSetDomain =
+    normalizedDomain &&
+    (host === normalizedDomain || host.endsWith(`.${normalizedDomain}`));
+
+  return shouldSetDomain ? { ...base, domain: COOKIE_DOMAIN } : base;
+}
+
+function issueSession(email) {
+  return jwt.sign({ sub: email, email, apps: ["pesa"] }, SESSION_JWT_SECRET, {
+    expiresIn: "12h",
+  });
+}
+
+function readSession(req) {
+  const token = req.cookies?.[SESSION_COOKIE];
+  if (!token) return null;
+  try {
+    return jwt.verify(token, SESSION_JWT_SECRET);
+  } catch {
+    return null;
+  }
+}
 // Use given credentials, but allow env override if present
 const dbConfig = {
   user: process.env.DB_USER || "PEL_DB",
@@ -129,6 +250,17 @@ IF NOT EXISTS (
 BEGIN
   CREATE NONCLUSTERED INDEX IX_pesa_data_baseDate
   ON dbo.pesa_data (baseDate);
+END;
+
+-- OTP storage (no SPOT dependency)
+IF OBJECT_ID('dbo.PesaLoginOTP', 'U') IS NULL
+BEGIN
+  CREATE TABLE dbo.PesaLoginOTP (
+    Email NVARCHAR(256) NOT NULL PRIMARY KEY,
+    OTP NVARCHAR(6) NOT NULL,
+    OTP_Expiry DATETIME2(0) NOT NULL,
+    CreatedAt DATETIME2(0) NOT NULL CONSTRAINT DF_PesaLoginOTP_CreatedAt DEFAULT SYSUTCDATETIME()
+  );
 END;
 `;
 
@@ -359,6 +491,33 @@ function buildExportMatrixFromDbRows(dbRows) {
   return { headers, rows };
 }
 
+function toSafeInt(v) {
+  if (v === null || v === undefined) return 0;
+
+  if (typeof v === "number") {
+    return Number.isFinite(v) ? Math.trunc(v) : 0;
+  }
+
+  // if some lib returns bigint
+  if (typeof v === "bigint") {
+    // keep within JS safe integer range; otherwise return as Number may lose precision
+    // for your use-case shares typically fit; if not, consider DECIMAL(38,0) in DB.
+    const n = Number(v);
+    return Number.isFinite(n) ? n : 0;
+  }
+
+  // strings like "1,23,456", "12,345", "-", ""
+  const s = String(v).trim();
+  if (!s || s === "-" || s.toLowerCase() === "na" || s.toLowerCase() === "null") return 0;
+
+  // remove commas (both 1,234 and 1,23,456)
+  const cleaned = s.replace(/,/g, "");
+
+  // allow negative too
+  const n = Number(cleaned);
+  return Number.isFinite(n) ? Math.trunc(n) : 0;
+}
+
 // Very basic payload validation/logging
 function validateImportPayload(body) {
   if (!body || typeof body !== "object") {
@@ -431,9 +590,10 @@ async function persistHoldingsToDb(holdings, dates) {
         continue;
       }
 
-      const value = Number(dv.value || 0);
-      const bought = Number(dv.bought || 0);
-      const sold = Number(dv.sold || 0);
+      const value = toSafeInt(dv.value);
+      const bought = toSafeInt(dv.bought);
+      const sold = toSafeInt(dv.sold);
+      
 
       table.rows.add(
         rowKey,
@@ -469,15 +629,17 @@ const app = express();
 
 // Middlewares
 app.use(helmet());
+app.set("trust proxy", 1);
 app.use(
   cors({
-    // When FE is served from same origin, this is effectively a no-op.
-    // You can restrict to specific origins if needed.
-    origin: process.env.CORS_ORIGIN || "*",
+        // reflect origin (works with credentials); same-origin requests ignore CORS anyway
+        origin: true,
+        credentials: true,
   })
 );
 app.use(compression());
 app.use(express.json({ limit: "25mb" }));
+app.use(cookieParser());
 app.use(
   morgan("dev", {
     skip: () => process.env.NODE_ENV === "test",
@@ -495,6 +657,201 @@ if (fs.existsSync(STATIC_DIR)) {
   });
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// AUTH GATE for API (protect all /api/* except auth/session/health)
+// ─────────────────────────────────────────────────────────────────────────────
+app.use((req, res, next) => {
+    if (!req.path.startsWith("/api/") && !req.path.startsWith("/auth/")) return next();
+  
+    // Always allow:
+    if (
+      req.path === "/api/health" ||
+      req.path === "/health" ||
+      req.path === "/api/session" ||
+      req.path === "/api/send-otp" ||
+      req.path === "/api/verify-otp" ||
+      req.path === "/auth/logout"
+    ) {
+    return next();
+   }
+ 
+  const session = readSession(req);
+   if (!session?.email) {
+      return res.status(401).json({ error: "unauthenticated" });
+    }
+  
+    // Optional: enforce allow-list even for existing sessions
+    if (!isAllowed(String(session.email))) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+  
+    req.user = session;
+    return next();
+  });
+  
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Session endpoint (frontend uses it on boot)
+  // ─────────────────────────────────────────────────────────────────────────────
+  app.get("/api/session", (req, res) => {
+    const s = readSession(req);
+    if (!s?.email) return res.status(401).json({ error: "unauthenticated" });
+    return res.json({ user: { email: s.email, apps: s.apps || ["pesa"] } });
+  });
+  
+  app.post("/auth/logout", (req, res) => {
+    const base = cookieBaseOptions(req);
+    res.clearCookie(SESSION_COOKIE, { ...base, path: "/" });
+    if (COOKIE_DOMAIN) {
+      // clear with explicit domain too (some browsers store it that way)
+      res.clearCookie(SESSION_COOKIE, { ...base, path: "/", domain: COOKIE_DOMAIN });
+    }
+  res.json({ ok: true });
+  });
+  
+  // ─────────────────────────────────────────────────────────────────────────────
+  // OTP: SEND
+  // ─────────────────────────────────────────────────────────────────────────────
+  app.post("/api/send-otp", async (req, res) => {
+    const email = normalizeEmail(req.body?.email);
+    if (!email) return res.status(400).json({ message: "Missing email" });
+  
+    if (!isAllowed(email)) {
+      return res.status(403).json({ message: "Access denied: this app is restricted." });
+    }
+  
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiry = new Date(Date.now() + 5 * 60 * 1000); // 5 mins
+  
+    try {
+      const pool = await getPool();
+      await pool
+        .request()
+        .input("Email", sql.NVarChar(256), email)
+        .input("OTP", sql.NVarChar(6), otp)
+        .input("Exp", sql.DateTime2(0), expiry)
+        .query(`
+          MERGE dbo.PesaLoginOTP AS T
+          USING (SELECT @Email AS Email) AS S
+          ON (T.Email = S.Email)
+          WHEN MATCHED THEN
+            UPDATE SET OTP=@OTP, OTP_Expiry=@Exp, CreatedAt=SYSUTCDATETIME()
+          WHEN NOT MATCHED THEN
+            INSERT (Email, OTP, OTP_Expiry) VALUES (@Email, @OTP, @Exp);
+        `);
+  
+      const baseUrl = `${req.protocol}://${req.get("host")}`;
+      const subject = "Your PESA One-Time Password (OTP)";
+      const html = `
+        <div style="margin:0;padding:0;background:#f5f7fb;">
+          <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="background:#f5f7fb;padding:24px 0;">
+            <tr>
+              <td align="center">
+                <table role="presentation" cellpadding="0" cellspacing="0" width="640" style="width:640px;max-width:94vw;background:#ffffff;border:1px solid #e6eaf2;border-radius:14px;overflow:hidden;font-family:Arial,Helvetica,sans-serif;">
+                  <tr>
+                    <td style="background:linear-gradient(90deg,#0f172a,#1e293b);padding:18px 22px;color:#fff;">
+                      <div style="font-size:14px;opacity:.9;">Premier Energies</div>
+                      <div style="font-size:20px;font-weight:700;margin-top:2px;">PESA • Secure Login</div>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td style="padding:22px;">
+                      <div style="font-size:14px;color:#334155;">Hi,</div>
+                      <div style="font-size:14px;color:#334155;margin-top:10px;line-height:1.6;">
+                        Use the OTP below to sign in to <strong>PESA</strong>. This code expires in <strong>5 minutes</strong>.
+                      </div>
+  
+                      <div style="margin:18px 0 10px;border:1px solid #e6eaf2;border-radius:12px;background:#f8fafc;padding:16px;text-align:center;">
+                        <div style="font-size:12px;color:#64748b;letter-spacing:.12em;text-transform:uppercase;">One-Time Password</div>
+                        <div style="font-size:34px;font-weight:800;letter-spacing:.18em;color:#0f172a;margin-top:6px;">${otp}</div>
+                      </div>
+  
+                      <div style="font-size:12px;color:#64748b;line-height:1.6;">
+                        Requested for: <span style="color:#0f172a;font-weight:600;">${email}</span><br/>
+                        If you didn’t request this, you can safely ignore this email.
+                      </div>
+  
+                      <div style="margin-top:18px;">
+                        <a href="${baseUrl}/login" style="display:inline-block;background:#2563eb;color:#fff;text-decoration:none;padding:10px 14px;border-radius:10px;font-size:14px;font-weight:700;">
+                          Open PESA
+                        </a>
+                      </div>
+  
+                      <div style="margin-top:20px;border-top:1px solid #eef2f7;padding-top:14px;font-size:12px;color:#94a3b8;line-height:1.6;">
+                        Security tip: Never share OTPs with anyone. Premier Energies staff will never ask for your OTP.
+                      </div>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td style="background:#f8fafc;border-top:1px solid #eef2f7;padding:14px 22px;color:#64748b;font-size:12px;">
+                      © ${new Date().getFullYear()} Premier Energies • Automated message
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+          </table>
+        </div>
+      `;
+  
+      await sendEmail(email, subject, html);
+      return res.json({ ok: true, message: "OTP sent successfully" });
+    } catch (err) {
+      console.error("send-otp error:", err?.stack || err);
+      return res.status(500).json({ message: "Server error" });
+    }
+  });
+  
+  // ─────────────────────────────────────────────────────────────────────────────
+  // OTP: VERIFY
+  // ─────────────────────────────────────────────────────────────────────────────
+  app.post("/api/verify-otp", async (req, res) => {
+    const email = normalizeEmail(req.body?.email);
+    const otp = String(req.body?.otp || "").trim();
+    if (!email) return res.status(400).json({ message: "Missing email" });
+    if (!otp) return res.status(400).json({ message: "Missing OTP" });
+  
+    if (!isAllowed(email)) {
+      return res.status(403).json({ message: "Access denied: this app is restricted." });
+    }
+  
+    try {
+      const pool = await getPool();
+      const r = await pool
+        .request()
+        .input("Email", sql.NVarChar(256), email)
+        .input("OTP", sql.NVarChar(6), otp)
+        .query(`
+          SELECT OTP_Expiry
+            FROM dbo.PesaLoginOTP WITH (NOLOCK)
+           WHERE Email=@Email AND OTP=@OTP;
+        `);
+  
+      if (!r.recordset?.length) {
+        return res.status(400).json({ message: "Invalid OTP" });
+      }
+  
+      const exp = new Date(r.recordset[0].OTP_Expiry);
+      if (new Date() > exp) {
+        return res.status(400).json({ message: "OTP expired" });
+      }
+  
+      // burn the OTP (best practice)
+      await pool
+        .request()
+        .input("Email", sql.NVarChar(256), email)
+        .query(`DELETE FROM dbo.PesaLoginOTP WHERE Email=@Email;`);
+  
+      // issue session cookie
+      const token = issueSession(email);
+      const base = cookieBaseOptions(req);
+      res.cookie(SESSION_COOKIE, token, { ...base, path: "/", maxAge: 12 * 60 * 60 * 1000 });
+  
+      return res.json({ ok: true, user: { email } });
+    } catch (err) {
+      console.error("verify-otp error:", err?.stack || err);
+      return res.status(500).json({ message: "Server error" });
+    }
+  });
 /**
  * POST /api/pesa/import
  *
@@ -716,9 +1073,10 @@ app.get("/api/pesa/rn", async (req, res) => {
       const snapshotPos = getSnapshotPosFromDateKeyServer(dateKey) ?? 0;
       const fileIndex = getFileIndexFromDateKeyServer(dateKey) ?? "";
 
-      const value = Number(row.value || 0);
-      const bought = Number(row.bought || 0);
-      const sold = Number(row.sold || 0);
+      const value = toSafeInt(row.value);
+      const bought = toSafeInt(row.bought);
+      const sold = toSafeInt(row.sold);
+      
 
       const key = `${dpid}|${clientId}|${nameNorm}`;
 

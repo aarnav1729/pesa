@@ -71,6 +71,7 @@ const Index = () => {
       try {
         const res = await fetch("/api/pesa/import", {
           method: "POST",
+          credentials: "include",
           headers: {
             "Content-Type": "application/json",
           },
