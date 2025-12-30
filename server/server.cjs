@@ -279,14 +279,61 @@ function getBaseDate(dateKey) {
 // Parse "DD-MM-YYYY" to JS Date
 function parseDateStringToJsDate(dateStr) {
   if (!dateStr) return null;
-  const m = /(\d{2})-(\d{2})-(\d{4})/.exec(dateStr);
-  if (!m) return null;
-  const [, dd, mm, yyyy] = m;
-  const day = Number(dd);
-  const month = Number(mm);
-  const year = Number(yyyy);
-  if (!day || !month || !year) return null;
-  return new Date(year, month - 1, day);
+  const s0 = String(dateStr).trim();
+  if (!s0) return null;
+
+  // Normalize separators
+  const s = s0.replace(/\./g, "-").replace(/\//g, "-");
+
+  // 1) DD-MM-YYYY or D-M-YYYY
+  let m = /^(\d{1,2})-(\d{1,2})-(\d{4})$/.exec(s);
+  if (m) {
+    const dd = Number(m[1]);
+    const mm = Number(m[2]);
+    const yyyy = Number(m[3]);
+    if (!dd || !mm || !yyyy) return null;
+    const d = new Date(yyyy, mm - 1, dd);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+
+  // 2) YYYY-MM-DD
+  m = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(s);
+  if (m) {
+    const yyyy = Number(m[1]);
+    const mm = Number(m[2]);
+    const dd = Number(m[3]);
+    if (!dd || !mm || !yyyy) return null;
+    const d = new Date(yyyy, mm - 1, dd);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+
+  // 3) DD-MMM-YYYY (e.g. 03-Dec-2025)
+  m = /^(\d{1,2})-([A-Za-z]{3})-(\d{4})$/.exec(s);
+  if (m) {
+    const dd = Number(m[1]);
+    const mon = m[2].toLowerCase();
+    const yyyy = Number(m[3]);
+    const months = {
+      jan: 0,
+      feb: 1,
+      mar: 2,
+      apr: 3,
+      may: 4,
+      jun: 5,
+      jul: 6,
+      aug: 7,
+      sep: 8,
+      oct: 9,
+      nov: 10,
+      dec: 11,
+    };
+    const mm = months[mon];
+    if (mm === undefined || !dd || !yyyy) return null;
+    const d = new Date(yyyy, mm, dd);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+
+  return null;
 }
 
 // Normalize name same as FE (trim whitespace and leading/trailing dots)
@@ -313,7 +360,8 @@ function getFileIndexFromDateKeyServer(dateKey) {
 // Extract snapshot position from dateKey like "03-12-2025@@1-2" (returns 1 or 2)
 function getSnapshotPosFromDateKeyServer(dateKey) {
   const parts = String(dateKey || "").split("@@");
-  if (parts.length < 2) return null;
+  if (parts.length < 2) return null; // <-- if no @@, always null
+
   const meta = parts[1]; // e.g. "1-2"
   const posStr = meta.split("-")[1];
   const pos = Number(posStr);
@@ -508,7 +556,8 @@ function toSafeInt(v) {
 
   // strings like "1,23,456", "12,345", "-", ""
   const s = String(v).trim();
-  if (!s || s === "-" || s.toLowerCase() === "na" || s.toLowerCase() === "null") return 0;
+  if (!s || s === "-" || s.toLowerCase() === "na" || s.toLowerCase() === "null")
+    return 0;
 
   // remove commas (both 1,234 and 1,23,456)
   const cleaned = s.replace(/,/g, "");
@@ -516,6 +565,106 @@ function toSafeInt(v) {
   // allow negative too
   const n = Number(cleaned);
   return Number.isFinite(n) ? Math.trunc(n) : 0;
+}
+
+function parsePackedBS(x) {
+  // supports: "+123-45", "+123 -45", "123/45", "123-45", "B:123 S:45"
+  const s = String(x || "").trim();
+  if (!s) return { bought: 0, sold: 0 };
+
+  // Case 1: explicit + and - tokens
+  const plus = /(?:\+|b[:\s]?)(\d[\d,]*)/i.exec(s);
+  const minus = /(?:-|s[:\s]?)(\d[\d,]*)/i.exec(s);
+
+  const bought = plus ? toSafeInt(plus[1]) : 0;
+  const sold = minus ? toSafeInt(minus[1]) : 0;
+
+  if (bought || sold) return { bought, sold };
+
+  // Case 2: "123/45" or "123-45" meaning bought/sold
+  const m = /^(\d[\d,]*)\s*[/\-]\s*(\d[\d,]*)$/.exec(s);
+  if (m) return { bought: toSafeInt(m[1]), sold: toSafeInt(m[2]) };
+
+  return { bought: 0, sold: 0 };
+}
+
+function normalizeDateValue(dv) {
+  if (dv === null || dv === undefined) return { value: 0, bought: 0, sold: 0 };
+
+  // ✅ Arrays are VERY common from parsers: [value, bought, sold] OR [value, "B/S"]
+  if (Array.isArray(dv)) {
+    const v = dv[0];
+    const b = dv[1];
+    const s = dv[2];
+
+    // if second is a packed B/S string like "+123-45"
+    if (typeof b === "string" && dv.length === 2) {
+      const bs = parsePackedBS(b);
+      return { value: toSafeInt(v), bought: bs.bought, sold: bs.sold };
+    }
+
+    return {
+      value: toSafeInt(v),
+      bought: toSafeInt(b),
+      sold: toSafeInt(s),
+    };
+  }
+
+  // primitives => holding value only
+  if (
+    typeof dv === "number" ||
+    typeof dv === "bigint" ||
+    typeof dv === "string"
+  ) {
+    return { value: toSafeInt(dv), bought: 0, sold: 0 };
+  }
+
+  if (typeof dv !== "object") return { value: 0, bought: 0, sold: 0 };
+
+  // object: try multiple keys
+  const v =
+    dv.value ??
+    dv.Value ??
+    dv.holding ??
+    dv.Holding ??
+    dv.qty ??
+    dv.Qty ??
+    dv.quantity ??
+    dv.Quantity ??
+    dv.v ??
+    dv.V ??
+    0;
+
+  // bought/sold can be separate OR in a single field (bs)
+  const b =
+    dv.bought ??
+    dv.Bought ??
+    dv.buy ??
+    dv.Buy ??
+    dv.purchase ??
+    dv.Purchase ??
+    dv.b ??
+    dv.B ??
+    0;
+
+  const s =
+    dv.sold ??
+    dv.Sold ??
+    dv.sell ??
+    dv.Sell ??
+    dv.sale ??
+    dv.Sale ??
+    dv.s ??
+    dv.S ??
+    0;
+
+  // if b is a packed string and sold is empty, parse it
+  if (typeof b === "string" && (!s || String(s).trim() === "")) {
+    const bs = parsePackedBS(b);
+    return { value: toSafeInt(v), bought: bs.bought, sold: bs.sold };
+  }
+
+  return { value: toSafeInt(v), bought: toSafeInt(b), sold: toSafeInt(s) };
 }
 
 // Very basic payload validation/logging
@@ -545,7 +694,6 @@ async function persistHoldingsToDb(holdings, dates) {
   await pool.request().query("TRUNCATE TABLE dbo.pesa_data;");
 
   const table = new sql.Table("dbo.pesa_data");
-  // Do not auto-create table, it already exists
   table.create = false;
 
   table.columns.add("rowKey", sql.NVarChar(450), { nullable: false });
@@ -558,12 +706,17 @@ async function persistHoldingsToDb(holdings, dates) {
   table.columns.add("value", sql.BigInt, { nullable: false });
   table.columns.add("bought", sql.BigInt, { nullable: false });
   table.columns.add("sold", sql.BigInt, { nullable: false });
-  // createdAt is defaulted by DB, no need to send
 
   let totalRows = 0;
+  let skippedBadDate = 0;
+  let sampleBadDate = null;
+
+  let nonZeroBought = 0;
+  let nonZeroSold = 0;
 
   for (const holding of holdings) {
     if (!holding || typeof holding !== "object") continue;
+
     const rowKey =
       holding.id ||
       `${holding.dpid || ""}-${holding.clientId || ""}-${holding.name || ""}`;
@@ -580,20 +733,23 @@ async function persistHoldingsToDb(holdings, dates) {
     const entries = Object.entries(dateValues);
 
     for (const [dateKey, dv] of entries) {
-      if (!dv) continue;
+      if (dv === null || dv === undefined) continue;
+
       const baseDateStr = getBaseDate(dateKey);
       const baseDateJs = parseDateStringToJsDate(baseDateStr);
       if (!baseDateJs) {
-        console.warn(
-          `[DB] Skipping invalid dateKey "${dateKey}" (base "${baseDateStr}") for rowKey="${rowKey}"`
-        );
+        skippedBadDate++;
+        if (!sampleBadDate) sampleBadDate = { dateKey, baseDateStr };
         continue;
       }
 
-      const value = toSafeInt(dv.value);
-      const bought = toSafeInt(dv.bought);
-      const sold = toSafeInt(dv.sold);
-      
+      const ndv = normalizeDateValue(dv);
+      const value = ndv.value;
+      const bought = ndv.bought;
+      const sold = ndv.sold;
+
+      if (bought) nonZeroBought++;
+      if (sold) nonZeroSold++;
 
       table.rows.add(
         rowKey,
@@ -607,6 +763,7 @@ async function persistHoldingsToDb(holdings, dates) {
         bought,
         sold
       );
+
       totalRows++;
     }
   }
@@ -615,14 +772,45 @@ async function persistHoldingsToDb(holdings, dates) {
     console.log(
       "[DB] No rows to insert (dateValues empty). Leaving table empty."
     );
-    return { rowsInserted: 0 };
+    return { rowsInserted: 0, dbStats: null, topRows: [] };
   }
 
-  console.log(`[DB] Bulk inserting ${totalRows} rows into dbo.pesa_data...`);
+  if (skippedBadDate > 0) {
+    console.warn(
+      `[DB] Skipped ${skippedBadDate} rows due to unparseable dates. Sample:`,
+      sampleBadDate
+    );
+  }
+
+  console.log(
+    `[DB] Bulk inserting ${totalRows} rows into dbo.pesa_data... (nonZeroBoughtRows=${nonZeroBought}, nonZeroSoldRows=${nonZeroSold})`
+  );
   await pool.request().bulk(table);
   console.log("[DB] Bulk insert complete.");
 
-  return { rowsInserted: totalRows };
+  const stats = await pool.request().query(`
+    SELECT
+      COUNT(1) AS rowsCount,
+      SUM(CAST(value AS BIGINT)) AS sumValue,
+      SUM(CAST(bought AS BIGINT)) AS sumBought,
+      SUM(CAST(sold AS BIGINT)) AS sumSold,
+      MAX(CAST(value AS BIGINT)) AS maxValue,
+      MAX(CAST(bought AS BIGINT)) AS maxBought,
+      MAX(CAST(sold AS BIGINT)) AS maxSold
+    FROM dbo.pesa_data WITH (NOLOCK);
+  `);
+
+  const top = await pool.request().query(`
+    SELECT TOP 5 dpid, clientId, name, category, dateKey, baseDate, value, bought, sold
+    FROM dbo.pesa_data WITH (NOLOCK)
+    ORDER BY (CASE WHEN value < 0 THEN -value ELSE value END) DESC;
+  `);
+
+  return {
+    rowsInserted: totalRows,
+    dbStats: stats.recordset?.[0] || null,
+    topRows: top.recordset || [],
+  };
 }
 
 const app = express();
@@ -632,9 +820,9 @@ app.use(helmet());
 app.set("trust proxy", 1);
 app.use(
   cors({
-        // reflect origin (works with credentials); same-origin requests ignore CORS anyway
-        origin: true,
-        credentials: true,
+    // reflect origin (works with credentials); same-origin requests ignore CORS anyway
+    origin: true,
+    credentials: true,
   })
 );
 app.use(compression());
@@ -661,75 +849,82 @@ if (fs.existsSync(STATIC_DIR)) {
 // AUTH GATE for API (protect all /api/* except auth/session/health)
 // ─────────────────────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
-    if (!req.path.startsWith("/api/") && !req.path.startsWith("/auth/")) return next();
-  
-    // Always allow:
-    if (
-      req.path === "/api/health" ||
-      req.path === "/health" ||
-      req.path === "/api/session" ||
-      req.path === "/api/send-otp" ||
-      req.path === "/api/verify-otp" ||
-      req.path === "/auth/logout"
-    ) {
+  if (!req.path.startsWith("/api/") && !req.path.startsWith("/auth/"))
     return next();
-   }
- 
+
+  // Always allow:
+  if (
+    req.path === "/api/health" ||
+    req.path === "/health" ||
+    req.path === "/api/session" ||
+    req.path === "/api/send-otp" ||
+    req.path === "/api/verify-otp" ||
+    req.path === "/auth/logout"
+  ) {
+    return next();
+  }
+
   const session = readSession(req);
-   if (!session?.email) {
-      return res.status(401).json({ error: "unauthenticated" });
-    }
-  
-    // Optional: enforce allow-list even for existing sessions
-    if (!isAllowed(String(session.email))) {
-      return res.status(403).json({ error: "forbidden" });
-    }
-  
-    req.user = session;
-    return next();
-  });
-  
-  // ─────────────────────────────────────────────────────────────────────────────
-  // Session endpoint (frontend uses it on boot)
-  // ─────────────────────────────────────────────────────────────────────────────
-  app.get("/api/session", (req, res) => {
-    const s = readSession(req);
-    if (!s?.email) return res.status(401).json({ error: "unauthenticated" });
-    return res.json({ user: { email: s.email, apps: s.apps || ["pesa"] } });
-  });
-  
-  app.post("/auth/logout", (req, res) => {
-    const base = cookieBaseOptions(req);
-    res.clearCookie(SESSION_COOKIE, { ...base, path: "/" });
-    if (COOKIE_DOMAIN) {
-      // clear with explicit domain too (some browsers store it that way)
-      res.clearCookie(SESSION_COOKIE, { ...base, path: "/", domain: COOKIE_DOMAIN });
-    }
+  if (!session?.email) {
+    return res.status(401).json({ error: "unauthenticated" });
+  }
+
+  // Optional: enforce allow-list even for existing sessions
+  if (!isAllowed(String(session.email))) {
+    return res.status(403).json({ error: "forbidden" });
+  }
+
+  req.user = session;
+  return next();
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Session endpoint (frontend uses it on boot)
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/api/session", (req, res) => {
+  const s = readSession(req);
+  if (!s?.email) return res.status(401).json({ error: "unauthenticated" });
+  return res.json({ user: { email: s.email, apps: s.apps || ["pesa"] } });
+});
+
+app.post("/auth/logout", (req, res) => {
+  const base = cookieBaseOptions(req);
+  res.clearCookie(SESSION_COOKIE, { ...base, path: "/" });
+  if (COOKIE_DOMAIN) {
+    // clear with explicit domain too (some browsers store it that way)
+    res.clearCookie(SESSION_COOKIE, {
+      ...base,
+      path: "/",
+      domain: COOKIE_DOMAIN,
+    });
+  }
   res.json({ ok: true });
-  });
-  
-  // ─────────────────────────────────────────────────────────────────────────────
-  // OTP: SEND
-  // ─────────────────────────────────────────────────────────────────────────────
-  app.post("/api/send-otp", async (req, res) => {
-    const email = normalizeEmail(req.body?.email);
-    if (!email) return res.status(400).json({ message: "Missing email" });
-  
-    if (!isAllowed(email)) {
-      return res.status(403).json({ message: "Access denied: this app is restricted." });
-    }
-  
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    const expiry = new Date(Date.now() + 5 * 60 * 1000); // 5 mins
-  
-    try {
-      const pool = await getPool();
-      await pool
-        .request()
-        .input("Email", sql.NVarChar(256), email)
-        .input("OTP", sql.NVarChar(6), otp)
-        .input("Exp", sql.DateTime2(0), expiry)
-        .query(`
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OTP: SEND
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/api/send-otp", async (req, res) => {
+  const email = normalizeEmail(req.body?.email);
+  if (!email) return res.status(400).json({ message: "Missing email" });
+
+  if (!isAllowed(email)) {
+    return res
+      .status(403)
+      .json({ message: "Access denied: this app is restricted." });
+  }
+
+  const otp = Math.floor(100000 + Math.random() * 900000).toString();
+  const expiry = new Date(Date.now() + 5 * 60 * 1000); // 5 mins
+
+  try {
+    const pool = await getPool();
+
+    await pool
+      .request()
+      .input("Email", sql.NVarChar(256), email)
+      .input("OTP", sql.NVarChar(6), otp)
+      .input("Exp", sql.DateTime2(0), expiry).query(`
           MERGE dbo.PesaLoginOTP AS T
           USING (SELECT @Email AS Email) AS S
           ON (T.Email = S.Email)
@@ -738,10 +933,10 @@ app.use((req, res, next) => {
           WHEN NOT MATCHED THEN
             INSERT (Email, OTP, OTP_Expiry) VALUES (@Email, @OTP, @Exp);
         `);
-  
-      const baseUrl = `${req.protocol}://${req.get("host")}`;
-      const subject = "Your PESA One-Time Password (OTP)";
-      const html = `
+
+    const baseUrl = `${req.protocol}://${req.get("host")}`;
+    const subject = "Your PESA One-Time Password (OTP)";
+    const html = `
         <div style="margin:0;padding:0;background:#f5f7fb;">
           <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="background:#f5f7fb;padding:24px 0;">
             <tr>
@@ -792,66 +987,71 @@ app.use((req, res, next) => {
           </table>
         </div>
       `;
-  
-      await sendEmail(email, subject, html);
-      return res.json({ ok: true, message: "OTP sent successfully" });
-    } catch (err) {
-      console.error("send-otp error:", err?.stack || err);
-      return res.status(500).json({ message: "Server error" });
-    }
-  });
-  
-  // ─────────────────────────────────────────────────────────────────────────────
-  // OTP: VERIFY
-  // ─────────────────────────────────────────────────────────────────────────────
-  app.post("/api/verify-otp", async (req, res) => {
-    const email = normalizeEmail(req.body?.email);
-    const otp = String(req.body?.otp || "").trim();
-    if (!email) return res.status(400).json({ message: "Missing email" });
-    if (!otp) return res.status(400).json({ message: "Missing OTP" });
-  
-    if (!isAllowed(email)) {
-      return res.status(403).json({ message: "Access denied: this app is restricted." });
-    }
-  
-    try {
-      const pool = await getPool();
-      const r = await pool
-        .request()
-        .input("Email", sql.NVarChar(256), email)
-        .input("OTP", sql.NVarChar(6), otp)
-        .query(`
+
+    await sendEmail(email, subject, html);
+    return res.json({ ok: true, message: "OTP sent successfully" });
+  } catch (err) {
+    console.error("send-otp error:", err?.stack || err);
+    return res.status(500).json({ message: "Server error" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OTP: VERIFY
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/api/verify-otp", async (req, res) => {
+  const email = normalizeEmail(req.body?.email);
+  const otp = String(req.body?.otp || "").trim();
+  if (!email) return res.status(400).json({ message: "Missing email" });
+  if (!otp) return res.status(400).json({ message: "Missing OTP" });
+
+  if (!isAllowed(email)) {
+    return res
+      .status(403)
+      .json({ message: "Access denied: this app is restricted." });
+  }
+
+  try {
+    const pool = await getPool();
+    const r = await pool
+      .request()
+      .input("Email", sql.NVarChar(256), email)
+      .input("OTP", sql.NVarChar(6), otp).query(`
           SELECT OTP_Expiry
             FROM dbo.PesaLoginOTP WITH (NOLOCK)
            WHERE Email=@Email AND OTP=@OTP;
         `);
-  
-      if (!r.recordset?.length) {
-        return res.status(400).json({ message: "Invalid OTP" });
-      }
-  
-      const exp = new Date(r.recordset[0].OTP_Expiry);
-      if (new Date() > exp) {
-        return res.status(400).json({ message: "OTP expired" });
-      }
-  
-      // burn the OTP (best practice)
-      await pool
-        .request()
-        .input("Email", sql.NVarChar(256), email)
-        .query(`DELETE FROM dbo.PesaLoginOTP WHERE Email=@Email;`);
-  
-      // issue session cookie
-      const token = issueSession(email);
-      const base = cookieBaseOptions(req);
-      res.cookie(SESSION_COOKIE, token, { ...base, path: "/", maxAge: 12 * 60 * 60 * 1000 });
-  
-      return res.json({ ok: true, user: { email } });
-    } catch (err) {
-      console.error("verify-otp error:", err?.stack || err);
-      return res.status(500).json({ message: "Server error" });
+
+    if (!r.recordset?.length) {
+      return res.status(400).json({ message: "Invalid OTP" });
     }
-  });
+
+    const exp = new Date(r.recordset[0].OTP_Expiry);
+    if (new Date() > exp) {
+      return res.status(400).json({ message: "OTP expired" });
+    }
+
+    // burn the OTP (best practice)
+    await pool
+      .request()
+      .input("Email", sql.NVarChar(256), email)
+      .query(`DELETE FROM dbo.PesaLoginOTP WHERE Email=@Email;`);
+
+    // issue session cookie
+    const token = issueSession(email);
+    const base = cookieBaseOptions(req);
+    res.cookie(SESSION_COOKIE, token, {
+      ...base,
+      path: "/",
+      maxAge: 12 * 60 * 60 * 1000,
+    });
+
+    return res.json({ ok: true, user: { email } });
+  } catch (err) {
+    console.error("verify-otp error:", err?.stack || err);
+    return res.status(500).json({ message: "Server error" });
+  }
+});
 /**
  * POST /api/pesa/import
  *
@@ -873,12 +1073,18 @@ app.post("/api/pesa/import", async (req, res) => {
   const { holdings, dates } = req.body;
 
   try {
-    const { rowsInserted } = await persistHoldingsToDb(holdings, dates);
+    const { rowsInserted, dbStats, topRows } = await persistHoldingsToDb(
+      holdings,
+      dates
+    );
+
     res.json({
       ok: true,
       holdingsCount: holdings.length,
       dateKeysCount: dates.length,
       rowsInserted,
+      dbStats,
+      topRows,
     });
   } catch (err) {
     console.error("[API] /api/pesa/import error", err);
@@ -956,6 +1162,23 @@ app.get("/api/pesa/rn", async (req, res) => {
 
   try {
     const pool = await getPool();
+    let dbStats = null;
+    try {
+      const s = await pool.request().query(`
+        SELECT
+          COUNT(1) AS rowsCount,
+          SUM(CAST(value AS BIGINT)) AS sumValue,
+          SUM(CAST(bought AS BIGINT)) AS sumBought,
+          SUM(CAST(sold AS BIGINT)) AS sumSold,
+          MAX(CAST(value AS BIGINT)) AS maxValue,
+          MAX(CAST(bought AS BIGINT)) AS maxBought,
+          MAX(CAST(sold AS BIGINT)) AS maxSold
+        FROM dbo.pesa_data WITH (NOLOCK);
+      `);
+      dbStats = s.recordset?.[0] || null;
+    } catch (e) {
+      console.warn("[RN] dbStats query failed:", e?.message || e);
+    }
 
     // Download headers
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -974,6 +1197,9 @@ app.get("/api/pesa/rn", async (req, res) => {
       useStyles: true,
       useSharedStrings: true,
     });
+
+    // Ensure Excel recalculates formulas on open (ExcelJS does not compute formulas)
+    workbook.calcProperties = { fullCalcOnLoad: true };
 
     // -------------------- Create sheets in the same order as FE export --------------------
     const wsSummary = workbook.addWorksheet("Summary");
@@ -1037,6 +1263,10 @@ app.get("/api/pesa/rn", async (req, res) => {
 
     let totalDbRows = 0;
 
+    let cntPos1 = 0;
+    let cntPos2 = 0;
+    let cntPos0 = 0;
+
     let globalMinSerial = Infinity;
     let globalMaxSerial = -Infinity;
 
@@ -1070,13 +1300,29 @@ app.get("/api/pesa/rn", async (req, res) => {
         }
       }
 
-      const snapshotPos = getSnapshotPosFromDateKeyServer(dateKey) ?? 0;
-      const fileIndex = getFileIndexFromDateKeyServer(dateKey) ?? "";
+      const snapshotPosRaw = getSnapshotPosFromDateKeyServer(dateKey);
+      const snapshotPos =
+        typeof snapshotPosRaw === "number"
+          ? snapshotPosRaw
+          : String(dateKey).includes("@@")
+          ? 0
+          : 2; // if no @@ meta, treat as snapshot 2
+
+      if (snapshotPos === 1) cntPos1++;
+      else if (snapshotPos === 2) cntPos2++;
+      else cntPos0++;
+
+      const fileIndexRaw = getFileIndexFromDateKeyServer(dateKey);
+      const fileIndex =
+        typeof fileIndexRaw === "number"
+          ? fileIndexRaw
+          : String(dateKey).includes("@@")
+          ? ""
+          : 1; // if no @@ meta, default fileIndex=1
 
       const value = toSafeInt(row.value);
       const bought = toSafeInt(row.bought);
       const sold = toSafeInt(row.sold);
-      
 
       const key = `${dpid}|${clientId}|${nameNorm}`;
 
@@ -1513,6 +1759,31 @@ app.get("/api/pesa/rn", async (req, res) => {
         wsMeta.columns = [{ width: 24 }, { width: 60 }];
         wsMeta.addRow(["ExportedAt", new Date().toISOString()]).commit();
         wsMeta.addRow(["DB Rows (dbo.pesa_data)", totalDbRows]).commit();
+        if (dbStats) {
+          wsMeta
+            .addRow(["DB Sum Value", String(dbStats.sumValue ?? "")])
+            .commit();
+          wsMeta
+            .addRow(["DB Sum Bought", String(dbStats.sumBought ?? "")])
+            .commit();
+          wsMeta
+            .addRow(["DB Sum Sold", String(dbStats.sumSold ?? "")])
+            .commit();
+          wsMeta
+            .addRow(["DB Max Value", String(dbStats.maxValue ?? "")])
+            .commit();
+          wsMeta
+            .addRow(["DB Max Bought", String(dbStats.maxBought ?? "")])
+            .commit();
+          wsMeta
+            .addRow(["DB Max Sold", String(dbStats.maxSold ?? "")])
+            .commit();
+        }
+
+        wsMeta.addRow(["SnapshotPos=1 rows", cntPos1]).commit();
+        wsMeta.addRow(["SnapshotPos=2 rows", cntPos2]).commit();
+        wsMeta.addRow(["SnapshotPos=other rows", cntPos0]).commit();
+
         wsMeta.addRow(["Unique Keys", rows.length]).commit();
         wsMeta.addRow(["Default Range From (serial)", minSerial]).commit();
         wsMeta.addRow(["Default Range To (serial)", maxSerial]).commit();
