@@ -1655,16 +1655,18 @@ app.get("/api/pesa/rn", async (req, res) => {
           ])
           .commit();
 
-        // -------------------- SummaryDynamic sheet (formulas) --------------------
-        // Use full-column ranges so we don't need last-row counts.
-        const keyR = `ByDate!$I:$I`; // Key
-        const dateR = `ByDate!$B:$B`; // BaseDateExcel
-        const rankR = `ByDate!$J:$J`; // KeyDateRank
-        const keyRankR = `ByDate!$K:$K`; // KeyRank
-        const valR = `ByDate!$L:$L`; // Value
-        const buyR = `ByDate!$M:$M`; // Bought
-        const soldR = `ByDate!$N:$N`; // Sold
-        const posR = `ByDate!$C:$C`; // SnapshotPos
+        // ByDate has header at row 1; data starts row 2
+        const byDateFirstRow = 2;
+        const byDateLastRow = Math.max(2, totalDbRows + 1); // header(1) + totalDbRows
+
+        const keyR = `ByDate!$I$${byDateFirstRow}:$I$${byDateLastRow}`; // Key
+        const dateR = `ByDate!$B$${byDateFirstRow}:$B$${byDateLastRow}`; // BaseDateExcel
+        const rankR = `ByDate!$J$${byDateFirstRow}:$J$${byDateLastRow}`; // KeyDateRank
+        const keyRankR = `ByDate!$K$${byDateFirstRow}:$K$${byDateLastRow}`; // KeyRank
+        const valR = `ByDate!$L$${byDateFirstRow}:$L$${byDateLastRow}`; // Value
+        const buyR = `ByDate!$M$${byDateFirstRow}:$M$${byDateLastRow}`; // Bought
+        const soldR = `ByDate!$N$${byDateFirstRow}:$N$${byDateLastRow}`; // Sold
+        const posR = `ByDate!$C$${byDateFirstRow}:$C$${byDateLastRow}`; // SnapshotPos
 
         const dynHeaders = [
           "Key",

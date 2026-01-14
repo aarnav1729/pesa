@@ -21,9 +21,13 @@ import {
   ChevronRight,
   ChevronDown,
   Info,
+  Copy,
 } from "lucide-react";
+
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
+import { toast } from "sonner";
+
 import { HoldingRecord } from "@/lib/db";
 import { cn } from "@/lib/utils";
 import {
@@ -446,6 +450,135 @@ export function MasterTable({
   const [isClearing, setIsClearing] = useState(false);
   const [isExportingXlsx, setIsExportingXlsx] = useState(false);
   const [isExportingSummaryXlsx, setIsExportingSummaryXlsx] = useState(false);
+
+  const [isCopyingSummary, setIsCopyingSummary] = useState(false);
+
+  // --- Clipboard helpers (Excel-friendly TSV) ---
+  function sanitizeCellForTSV(v: any): string {
+    // Excel TSV: tabs/newlines break cells; keep it safe
+    const s = v === null || v === undefined ? "" : String(v);
+    return s.replace(/\t/g, " ").replace(/\r?\n/g, " ");
+  }
+
+  async function copyTextToClipboard(text: string) {
+    // Modern API
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+    // Fallback for older/locked-down browsers
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "true");
+    ta.style.position = "fixed";
+    ta.style.left = "-9999px";
+    ta.style.top = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand("copy");
+    ta.remove();
+  }
+
+  const buildSummaryTSV = () => {
+    // Must match your UI column order
+    const headers = [
+      "DPID",
+      "ClientID",
+      "Category",
+      "Sold",
+      "Name",
+      "Bought",
+      "Initial Holding",
+      "Net B/S (Bought - Sold)",
+      "Still Holding",
+    ];
+
+    // Totals row (same meaning as UI "Total" row)
+    const totalsRow = [
+      "",
+      "",
+      "",
+      summaryTotals.sold,
+      "Total",
+      summaryTotals.bought,
+      summaryTotals.initial,
+      summaryTotals.net,
+      summaryTotals.still,
+    ];
+
+    const rows = summaryRows.map((r) => [
+      r.dpid,
+      r.clientId,
+      r.category || "",
+      r.sold,
+      r.name,
+      r.bought,
+      r.initialHolding,
+      r.net,
+      r.stillHolding,
+    ]);
+
+    const all = [headers, totalsRow, ...rows];
+
+    // TSV with CRLF helps Excel on Windows
+    return all
+      .map((row) => row.map(sanitizeCellForTSV).join("\t"))
+      .join("\r\n");
+  };
+
+  const handleCopySummaryTable = async () => {
+    if (!summaryRows.length) return;
+
+    try {
+      setIsCopyingSummary(true);
+      const tsv = buildSummaryTSV();
+      await copyTextToClipboard(tsv);
+
+      // If you imported toast:
+      toast?.success?.("Copied Summary table — paste into Excel (Ctrl+V)");
+
+      // If you did NOT import toast, comment the line above and uncomment this:
+      // alert("Copied Summary table — paste into Excel (Ctrl+V)");
+    } catch (e) {
+      console.error("Copy summary failed:", e);
+      toast?.error?.("Copy failed. Check browser permissions / console.");
+
+      // If no toast:
+      // alert("Copy failed. Check browser permissions / console.");
+    } finally {
+      setIsCopyingSummary(false);
+    }
+  };
+
+  const [isCopyingMatrix, setIsCopyingMatrix] = useState(false);
+
+  const buildMatrixTSV = () => {
+    const { headers, rows } = buildExportMatrix(); // already uses ALL filteredData (not paginated)
+    const all = [headers, ...rows];
+
+    return all
+      .map((row) => row.map(sanitizeCellForTSV).join("\t"))
+      .join("\r\n");
+  };
+
+  const handleCopyMatrixTable = async () => {
+    if (!filteredData.length) return;
+
+    try {
+      setIsCopyingMatrix(true);
+      const tsv = buildMatrixTSV();
+      await copyTextToClipboard(tsv);
+      toast?.success?.(
+        `Copied Master Matrix (${filteredData.length} rows) — paste into Excel (Ctrl+V)`
+      );
+    } catch (e) {
+      console.error("Copy matrix failed:", e);
+      toast?.error?.("Copy failed. Check browser permissions / console.");
+    } finally {
+      setIsCopyingMatrix(false);
+    }
+  };
+
   // Map of id -> {value, dateBase} for "Initial Holding"
   const initialHoldingMap = useMemo(() => {
     const map = new Map<string, { value: number; dateBase: string }>();
@@ -1252,7 +1385,7 @@ export function MasterTable({
         ? firstDataRow + dynDataRows.length - 1
         : firstDataRow;
 
-        const totalsRowDynamic: any[] = [
+      const totalsRowDynamic: any[] = [
         "", // Key
         "", // DPID
         "", // ClientID
@@ -1582,9 +1715,10 @@ export function MasterTable({
       <DropdownMenuTrigger asChild>
         <Button variant="outline" size="sm" className="shadow-enterprise">
           <ArrowUpDown className="w-4 h-4" />
-          Sort: {summarySortKey}
+          Sort
         </Button>
       </DropdownMenuTrigger>
+
       <DropdownMenuContent align="end">
         {(
           [
@@ -1599,6 +1733,7 @@ export function MasterTable({
             {k}
           </DropdownMenuItem>
         ))}
+
         <DropdownMenuItem
           onClick={() =>
             setSummarySortDir((d) => (d === "asc" ? "desc" : "asc"))
@@ -1857,6 +1992,33 @@ export function MasterTable({
           <Button
             variant="outline"
             size="sm"
+            onClick={handleCopyMatrixTable}
+            disabled={isCopyingMatrix || filteredData.length === 0}
+            className="shadow-enterprise"
+            title="Copy the entire Master Matrix (all filtered rows, not just current page) for pasting into Excel"
+          >
+            <Copy className="w-4 h-4" />
+            {isCopyingMatrix ? "Copying..." : "Copy Matrix (Excel)"}
+          </Button>
+
+          <Button
+  variant="outline"
+  size="sm"
+  onClick={async () => {
+    setSummaryOpen(true); // so it's obvious what you copied
+    await handleCopySummaryTable();
+  }}
+  disabled={isCopyingSummary || summaryRows.length === 0}
+  className="shadow-enterprise"
+  title="Copy the entire Summary table (headers + totals + all filtered rows) for pasting into Excel"
+>
+  <Copy className="w-4 h-4" />
+  {isCopyingSummary ? "Copying..." : "Copy Summary (Excel)"}
+</Button>
+
+          <Button
+            variant="outline"
+            size="sm"
             onClick={exportToXLSX}
             disabled={isExportingXlsx}
             className="shadow-enterprise"
@@ -1993,6 +2155,19 @@ export function MasterTable({
                 </div>
 
                 {/* Sort menu */}
+                {/* Copy + Sort */}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="shadow-enterprise"
+                  onClick={handleCopySummaryTable}
+                  disabled={isCopyingSummary || summaryRows.length === 0}
+                  title="Copy the entire Summary table (headers + totals + all filtered rows) for pasting into Excel"
+                >
+                  <Copy className="w-4 h-4" />
+                  {isCopyingSummary ? "Copying..." : "Copy Summary (Excel)"}
+                </Button>
+
                 <SummarySortMenu />
 
                 <Button
