@@ -64,10 +64,15 @@ const ALLOWED = new Set(
 );
 // Safe fallback (keep aligned with your Login.tsx)
 if (ALLOWED.size === 0) {
-  ["vcs@premierenergies.com", "saluja@premierenergies.com"].forEach((e) =>
-    ALLOWED.add(e)
-  );
+  [
+    "vcs@premierenergies.com",
+    "saluja@premierenergies.com",
+    "aarnav.singh@premierenergies.com",
+  ].forEach((e) => ALLOWED.add(e));
 }
+
+// Ensure this admin user is always allowed (even if PESA_ALLOWED_EMAILS is set)
+ALLOWED.add("aarnav.singh@premierenergies.com");
 
 function normalizeEmail(userInput = "") {
   const raw = String(userInput || "")
@@ -815,6 +820,22 @@ async function persistHoldingsToDb(holdings, dates) {
 
 const app = express();
 
+// CMD+F: const app = express();
+const JSON_LIMIT = process.env.JSON_LIMIT || "50mb";
+
+// CMD+F: app.use(express.json
+app.use(express.json({ limit: JSON_LIMIT }));
+app.use(express.urlencoded({ extended: true, limit: JSON_LIMIT }));
+
+// CMD+F: app.use(cors
+app.use((err, req, res, next) => {
+  // body-parser / express.json limit error
+  if (err && err.type === "entity.too.large") {
+    return res.status(413).json({ error: "Payload too large" });
+  }
+  return next(err);
+});
+
 // Middlewares
 app.use(helmet());
 app.set("trust proxy", 1);
@@ -826,7 +847,7 @@ app.use(
   })
 );
 app.use(compression());
-app.use(express.json({ limit: "25mb" }));
+
 app.use(cookieParser());
 app.use(
   morgan("dev", {

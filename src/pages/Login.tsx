@@ -306,8 +306,7 @@ const Login: React.FC = () => {
             </div>
 
             <div className="text-xs text-muted-foreground">
-              Local-first shareholding analysis • IndexedDB in-browser storage •
-              Optional sync to PESA SQL backend
+              Premier Energies © {new Date().getFullYear()}. All rights reserved.
             </div>
           </div>
         </div>
