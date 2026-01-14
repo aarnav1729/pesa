@@ -272,13 +272,22 @@ function InfoHint({ content }: { content: ReactNode }) {
 
   const onBlur = () => setOpen(false);
 
-  const attachWindowListeners = open;
+  useEffect(() => {
+    if (!open) return;
+    if (typeof window === "undefined") return;
 
-  if (attachWindowListeners && typeof window !== "undefined") {
-    window.requestAnimationFrame(() => {
-      computePos();
-    });
-  }
+    const onReflow = () => computePos();
+    const raf = window.requestAnimationFrame(onReflow);
+
+    window.addEventListener("resize", onReflow);
+    window.addEventListener("scroll", onReflow, true);
+
+    return () => {
+      window.cancelAnimationFrame(raf);
+      window.removeEventListener("resize", onReflow);
+      window.removeEventListener("scroll", onReflow, true);
+    };
+  }, [open]);
 
   return (
     <span
@@ -439,6 +448,61 @@ function PaginationControls({
   );
 }
 
+// ===== Virtualized dropdown list (no deps) =====
+const MENU_VIEWPORT_PX = 208; // matches Tailwind max-h-52
+const MENU_ROW_PX = 32;
+
+function VirtualizedMenuList({
+  items,
+  renderItem,
+  height = MENU_VIEWPORT_PX,
+  rowHeight = MENU_ROW_PX,
+  overscan = 6,
+}: {
+  items: string[];
+  renderItem: (item: string, index: number) => ReactNode;
+  height?: number;
+  rowHeight?: number;
+  overscan?: number;
+}) {
+  const [scrollTop, setScrollTop] = useState(0);
+
+  const total = items.length;
+  const start = Math.max(0, Math.floor(scrollTop / rowHeight) - overscan);
+  const visibleCount = Math.ceil(height / rowHeight) + overscan * 2;
+  const end = Math.min(total, start + visibleCount);
+
+  const slice = total ? items.slice(start, end) : [];
+
+  return (
+    <div
+      className="overflow-y-auto"
+      style={{ height }}
+      onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
+    >
+      <div style={{ height: total * rowHeight, position: "relative" }}>
+        {slice.map((item, i) => {
+          const idx = start + i;
+          return (
+            <div
+              key={`${idx}-${item}`}
+              style={{
+                position: "absolute",
+                top: idx * rowHeight,
+                left: 0,
+                right: 0,
+                height: rowHeight,
+              }}
+            >
+              {renderItem(item, idx)}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 export function MasterTable({
   holdings,
   dates,
@@ -479,6 +543,236 @@ export function MasterTable({
     ta.select();
     document.execCommand("copy");
     ta.remove();
+  }
+
+  // --- Rich clipboard (Excel keeps formatting if we write text/html) ---
+  function escapeHtml(v: any): string {
+    const s = v === null || v === undefined ? "" : String(v);
+    return s
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+  const __colorCache = new Map<string, string>();
+  function getCssColorForClass(className: string): string {
+    if (__colorCache.has(className)) return __colorCache.get(className)!;
+    if (typeof document === "undefined") return "";
+
+    const el = document.createElement("span");
+    el.className = className;
+    el.style.position = "fixed";
+    el.style.left = "-9999px";
+    el.style.top = "0";
+    el.textContent = "x";
+    document.body.appendChild(el);
+
+    const color = window.getComputedStyle(el).color || "";
+    el.remove();
+
+    __colorCache.set(className, color);
+    return color;
+  }
+
+  async function copyTableToClipboard(tsv: string, html: string) {
+    const ClipboardItemCtor = (window as any).ClipboardItem;
+
+    // Rich clipboard path (best for Excel)
+    if (navigator.clipboard?.write && ClipboardItemCtor) {
+      try {
+        const item = new ClipboardItemCtor({
+          "text/html": new Blob([html], { type: "text/html" }),
+          "text/plain": new Blob([tsv], { type: "text/plain" }),
+        });
+        await navigator.clipboard.write([item]);
+        return;
+      } catch (e) {
+        // Some environments block rich clipboard (permissions / non-HTTPS / policies)
+        console.warn("Rich clipboard write failed, falling back to TSV:", e);
+      }
+    }
+
+    // Fallback: plain text TSV
+    await copyTextToClipboard(tsv);
+  }
+
+  function buildSummarySelectionHTML() {
+    const headers = [
+      "DPID",
+      "ClientID",
+      "Category",
+      "Sold",
+      "Name",
+      "Bought",
+      "Initial Holding",
+      "Net B/S (Bought - Sold)",
+      "Still Holding",
+    ];
+
+    const success = getCssColorForClass("text-success") || "green";
+    const destructive = getCssColorForClass("text-destructive") || "red";
+    const muted = getCssColorForClass("text-muted-foreground") || "#666";
+
+    const baseCell =
+      "padding:6px 10px; border:1px solid #e5e7eb; font-size:12px; white-space:nowrap;";
+    const leftCell = `${baseCell} text-align:left;`;
+    const rightCell = `${baseCell} text-align:right; font-variant-numeric: tabular-nums;`;
+
+    const thead =
+      "<thead><tr>" +
+      headers
+        .map(
+          (h) =>
+            `<th style="${leftCell} font-weight:700; background:#f8fafc;">${escapeHtml(
+              h
+            )}</th>`
+        )
+        .join("") +
+      "</tr></thead>";
+
+    const tbody =
+      "<tbody>" +
+      summaryRows
+        .map((r) => {
+          const netColor =
+            r.net > 0 ? success : r.net < 0 ? destructive : muted;
+
+          return (
+            "<tr>" +
+            `<td style="${leftCell} font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;">${escapeHtml(
+              r.dpid
+            )}</td>` +
+            `<td style="${leftCell} font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;">${escapeHtml(
+              r.clientId
+            )}</td>` +
+            `<td style="${leftCell}">${escapeHtml(r.category || "")}</td>` +
+            `<td style="${rightCell} color:${destructive}; font-weight:700;">${escapeHtml(
+              r.sold
+            )}</td>` +
+            `<td style="${leftCell} font-weight:600;">${escapeHtml(
+              r.name
+            )}</td>` +
+            `<td style="${rightCell} color:${success}; font-weight:700;">${escapeHtml(
+              r.bought
+            )}</td>` +
+            `<td style="${rightCell}">${escapeHtml(r.initialHolding)}</td>` +
+            `<td style="${rightCell} color:${netColor}; font-weight:700;">${escapeHtml(
+              r.net
+            )}</td>` +
+            `<td style="${rightCell}">${escapeHtml(r.stillHolding)}</td>` +
+            "</tr>"
+          );
+        })
+        .join("") +
+      "</tbody>";
+
+    return `<table style="border-collapse:collapse;">${thead}${tbody}</table>`;
+  }
+
+  function buildSummaryHTML() {
+    const headers = [
+      "DPID",
+      "ClientID",
+      "Category",
+      "Sold",
+      "Name",
+      "Bought",
+      "Initial Holding",
+      "Net B/S (Bought - Sold)",
+      "Still Holding",
+    ];
+
+    const success = getCssColorForClass("text-success") || "green";
+    const destructive = getCssColorForClass("text-destructive") || "red";
+    const muted = getCssColorForClass("text-muted-foreground") || "#666";
+
+    const baseCell =
+      "padding:6px 10px; border:1px solid #e5e7eb; font-size:12px; white-space:nowrap;";
+    const leftCell = `${baseCell} text-align:left;`;
+    const rightCell = `${baseCell} text-align:right; font-variant-numeric: tabular-nums;`;
+
+    const thead =
+      "<thead><tr>" +
+      headers
+        .map(
+          (h) =>
+            `<th style="${leftCell} font-weight:700; background:#f8fafc;">${escapeHtml(
+              h
+            )}</th>`
+        )
+        .join("") +
+      "</tr></thead>";
+
+    const totalsNetColor =
+      summaryTotals.net > 0
+        ? success
+        : summaryTotals.net < 0
+        ? destructive
+        : muted;
+
+    const totalsRow =
+      "<tr>" +
+      `<td style="${leftCell}"></td>` +
+      `<td style="${leftCell}"></td>` +
+      `<td style="${leftCell}"></td>` +
+      `<td style="${rightCell} color:${destructive}; font-weight:700;">${escapeHtml(
+        summaryTotals.sold
+      )}</td>` +
+      `<td style="${leftCell} font-weight:700;">Total</td>` +
+      `<td style="${rightCell} color:${success}; font-weight:700;">${escapeHtml(
+        summaryTotals.bought
+      )}</td>` +
+      `<td style="${rightCell} font-weight:700;">${escapeHtml(
+        summaryTotals.initial
+      )}</td>` +
+      `<td style="${rightCell} color:${totalsNetColor}; font-weight:800;">${escapeHtml(
+        summaryTotals.net
+      )}</td>` +
+      `<td style="${rightCell} font-weight:700;">${escapeHtml(
+        summaryTotals.still
+      )}</td>` +
+      "</tr>";
+
+    const tbody =
+      "<tbody>" +
+      totalsRow +
+      summaryRows
+        .map((r) => {
+          const netColor =
+            r.net > 0 ? success : r.net < 0 ? destructive : muted;
+
+          return (
+            "<tr>" +
+            `<td style="${leftCell} font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;">${escapeHtml(
+              r.dpid
+            )}</td>` +
+            `<td style="${leftCell} font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;">${escapeHtml(
+              r.clientId
+            )}</td>` +
+            `<td style="${leftCell}">${escapeHtml(r.category || "")}</td>` +
+            `<td style="${rightCell} color:${destructive}; font-weight:700;">${escapeHtml(
+              r.sold
+            )}</td>` +
+            `<td style="${leftCell} font-weight:600;">${escapeHtml(
+              r.name
+            )}</td>` +
+            `<td style="${rightCell} color:${success}; font-weight:700;">${escapeHtml(
+              r.bought
+            )}</td>` +
+            `<td style="${rightCell}">${escapeHtml(r.initialHolding)}</td>` +
+            `<td style="${rightCell} color:${netColor}; font-weight:700;">${escapeHtml(
+              r.net
+            )}</td>` +
+            `<td style="${rightCell}">${escapeHtml(r.stillHolding)}</td>` +
+            "</tr>"
+          );
+        })
+        .join("") +
+      "</tbody>";
+
+    return `<table style="border-collapse:collapse;">${thead}${tbody}</table>`;
   }
 
   const buildSummaryTSV = () => {
@@ -575,7 +869,8 @@ export function MasterTable({
     try {
       setIsCopyingSummarySelection(true);
       const tsv = buildSummarySelectionTSV();
-      await copyTextToClipboard(tsv);
+      const html = buildSummarySelectionHTML();
+      await copyTableToClipboard(tsv, html);
 
       toast?.success?.(
         `Copied ${summaryRows.length} selected row(s) — paste into Excel (Ctrl+V)`
@@ -594,7 +889,8 @@ export function MasterTable({
     try {
       setIsCopyingSummary(true);
       const tsv = buildSummaryTSV();
-      await copyTextToClipboard(tsv);
+      const html = buildSummaryHTML();
+      await copyTableToClipboard(tsv, html);
 
       // If you imported toast:
       toast?.success?.("Copied Summary table — paste into Excel (Ctrl+V)");
@@ -1078,10 +1374,29 @@ export function MasterTable({
     const [open, setOpen] = useState(false);
     const [optionQuery, setOptionQuery] = useState("");
 
-    const q = optionQuery.trim().toLowerCase();
-    const visibleOptions = values.filter((opt) =>
-      q ? opt.toLowerCase().includes(q) : true
-    );
+    const deferredOptionQuery = useDeferredValue(optionQuery);
+    const q = deferredOptionQuery.trim().toLowerCase();
+
+    // Build lowercased index ONLY when menu is open (otherwise do nothing)
+    const indexed = useMemo(() => {
+      if (!open) return [];
+      return values.map((v) => ({ raw: v, lower: v.toLowerCase() }));
+    }, [open, values]);
+
+    // Visible options:
+    // - when closed: []
+    // - when open & q empty: use original values (NO full scan)
+    // - when q set: scan indexed (still O(n) but fast enough + list is virtualized)
+    const visibleOptions = useMemo(() => {
+      if (!open) return [];
+      if (!q) return values;
+
+      const out: string[] = [];
+      for (const it of indexed) {
+        if (it.lower.includes(q)) out.push(it.raw);
+      }
+      return out;
+    }, [open, q, values, indexed]);
 
     return (
       <DropdownMenu
@@ -1114,6 +1429,11 @@ export function MasterTable({
               placeholder={`Search ${label}`}
               value={optionQuery}
               onChange={(e) => setOptionQuery(e.target.value)}
+              onKeyDownCapture={(e) => {
+                // Prevent Radix DropdownMenu typeahead from stealing focus
+                // (it was jumping focus to "Clear filter" while typing)
+                if (e.key !== "Escape") e.stopPropagation();
+              }}
               className="h-7 text-xs"
             />
           </div>
@@ -1130,25 +1450,28 @@ export function MasterTable({
           </DropdownMenuItem>
 
           {/* Values list */}
-          <div className="max-h-52 overflow-y-auto">
-            {visibleOptions.length === 0 && (
+          {/* Values list (VIRTUALIZED) */}
+          <div className="max-h-52 overflow-hidden">
+            {visibleOptions.length === 0 ? (
               <div className="px-3 py-2 text-xs text-muted-foreground">
                 No matches
               </div>
+            ) : (
+              <VirtualizedMenuList
+                items={visibleOptions}
+                renderItem={(opt) => (
+                  <DropdownMenuItem
+                    onSelect={() => {
+                      setFilters((prev) => ({ ...prev, [columnKey]: opt }));
+                      setOptionQuery("");
+                      setOpen(false);
+                    }}
+                  >
+                    <span className="text-xs truncate">{opt}</span>
+                  </DropdownMenuItem>
+                )}
+              />
             )}
-
-            {visibleOptions.map((opt) => (
-              <DropdownMenuItem
-                key={opt}
-                onClick={() => {
-                  setFilters((prev) => ({ ...prev, [columnKey]: opt })); // apply filter only on selection
-                  setOptionQuery("");
-                  setOpen(false);
-                }}
-              >
-                <span className="text-xs">{opt}</span>
-              </DropdownMenuItem>
-            ))}
           </div>
         </DropdownMenuContent>
       </DropdownMenu>
@@ -2009,10 +2332,30 @@ export function MasterTable({
     const [open, setOpen] = useState(false);
     const [optionQuery, setOptionQuery] = useState("");
 
-    const q = optionQuery.trim().toLowerCase();
-    const visibleOptions = allOptions.filter((opt) =>
-      q ? opt.toLowerCase().includes(q) : true
-    );
+    const keepOpenRef = useRef(false);
+
+    const deferredOptionQuery = useDeferredValue(optionQuery);
+    const q = deferredOptionQuery.trim().toLowerCase();
+
+    const indexed = useMemo(() => {
+      if (!open) return [];
+      return allOptions.map((v) => ({ raw: v, lower: v.toLowerCase() }));
+    }, [open, allOptions]);
+
+    const visibleOptions = useMemo(() => {
+      if (!open) return [];
+      if (!q) return allOptions;
+
+      const out: string[] = [];
+      for (const it of indexed) {
+        if (it.lower.includes(q)) out.push(it.raw);
+      }
+      return out;
+    }, [open, q, allOptions, indexed]);
+
+    const selectedSet = useMemo(() => {
+      return isName ? new Set(summarySelectedNames) : null;
+    }, [isName, summarySelectedNames]);
 
     const selectedCount = isName ? summarySelectedNames.length : 0;
     const isActive = isName ? selectedCount > 0 : !!appliedValue;
@@ -2021,6 +2364,10 @@ export function MasterTable({
       <DropdownMenu
         open={open}
         onOpenChange={(o) => {
+          if (!o && keepOpenRef.current) {
+            keepOpenRef.current = false;
+            return;
+          }
           setOpen(o);
           if (o) setOptionQuery(""); // reset search each open
         }}
@@ -2053,6 +2400,10 @@ export function MasterTable({
               placeholder={`Search ${label}`}
               value={optionQuery}
               onChange={(e) => setOptionQuery(e.target.value)}
+              onKeyDownCapture={(e) => {
+                // Prevent Radix DropdownMenu typeahead from stealing focus
+                if (e.key !== "Escape") e.stopPropagation();
+              }}
               className="h-7 text-xs"
             />
           </div>
@@ -2060,79 +2411,82 @@ export function MasterTable({
           {/* Clear applied filter */}
           <DropdownMenuItem
             onSelect={(e) => {
-              if (isName) e.preventDefault(); // keep open for multi-select UX
-
-              // clear selection/filter
               if (isName) {
+                // ✅ keep open for name multi-select clear as well
+                keepOpenRef.current = true;
+                e.preventDefault();
                 setSummarySelectedNames([]);
-              } else {
-                setSummaryFieldFilters((prev) => ({
-                  ...prev,
-                  [columnKey]: "",
-                }));
-                setOpen(false);
+                setOptionQuery("");
+                return;
               }
 
+              setSummaryFieldFilters((prev) => ({
+                ...prev,
+                [columnKey]: "",
+              }));
               setOptionQuery("");
+              setOpen(false);
             }}
           >
             <span className="text-muted-foreground text-xs">Clear filter</span>
           </DropdownMenuItem>
 
           {/* Values list */}
-          <div className="max-h-52 overflow-y-auto">
-            {visibleOptions.length === 0 && (
+          {/* Values list (VIRTUALIZED) */}
+          <div className="max-h-52 overflow-hidden">
+            {visibleOptions.length === 0 ? (
               <div className="px-3 py-2 text-xs text-muted-foreground">
                 No matches
               </div>
+            ) : (
+              <VirtualizedMenuList
+                items={visibleOptions}
+                renderItem={(opt) => {
+                  const checked = isName ? !!selectedSet?.has(opt) : false;
+
+                  return (
+                    <DropdownMenuItem
+                      onSelect={(e) => {
+                        if (isName) {
+                          // ✅ THIS is the key
+                          keepOpenRef.current = true;
+                          e.preventDefault(); // don't let Radix close it
+                          setSummarySelectedNames((prev) => {
+                            if (prev.includes(opt))
+                              return prev.filter((x) => x !== opt);
+                            return [...prev, opt];
+                          });
+                          return;
+                        }
+
+                        setSummaryFieldFilters((prev) => ({
+                          ...prev,
+                          [columnKey]: opt,
+                        }));
+                        setOptionQuery("");
+                        setOpen(false);
+                      }}
+                    >
+                      {isName ? (
+                        <div className="flex items-center gap-2">
+                          <span
+                            className={cn(
+                              "w-4 text-center",
+                              checked ? "text-primary" : "text-muted-foreground"
+                            )}
+                          >
+                            {checked ? "✓" : ""}
+                          </span>
+                          <span className="text-xs truncate">{opt}</span>
+                        </div>
+                      ) : (
+                        <span className="text-xs truncate">{opt}</span>
+                      )}
+                    </DropdownMenuItem>
+                  );
+                }}
+              />
             )}
-
-            {visibleOptions.map((opt) => {
-              const checked = isName
-                ? summarySelectedNames.includes(opt)
-                : false;
-
-              return (
-                <DropdownMenuItem
-                  key={opt}
-                  onSelect={(e) => {
-                    if (isName) {
-                      e.preventDefault(); // keep open for multi-select
-                      setSummarySelectedNames((prev) => {
-                        if (prev.includes(opt))
-                          return prev.filter((x) => x !== opt);
-                        return [...prev, opt];
-                      });
-                      return;
-                    }
-
-                    // single-select apply for other columns
-                    setSummaryFieldFilters((prev) => ({
-                      ...prev,
-                      [columnKey]: opt,
-                    }));
-                    setOptionQuery("");
-                    setOpen(false);
-                  }}
-                >
-                  {isName ? (
-                    <div className="flex items-center gap-2">
-                      <span
-                        className={cn(
-                          "w-4 text-center",
-                          checked ? "text-primary" : "text-muted-foreground"
-                        )}
-                      >
-                        {checked ? "✓" : ""}
-                      </span>
-                      <span className="text-xs">{opt}</span>
-                    </div>
-                  ) : (
-                    <span className="text-xs">{opt}</span>
-                  )}
-                </DropdownMenuItem>
-              );
-            })}
           </div>
         </DropdownMenuContent>
       </DropdownMenu>
